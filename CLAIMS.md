@@ -9,3 +9,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 |---|---|---|---|
 | shader/add-sub-nc (pixel_aot v_add/sub/subrev_nc forms) | PC-Joshua | 2026-11-22 11:30 | local, not yet a PR |
 | cpu/exe-start-termination (#281 follow-up) | PC-Joshua | 2026-11-22 09:30 | local, not yet a PR |
+| test-handshake | PC-Joshua | 2026-11-22 13:43 | selftest |
