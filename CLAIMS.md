@@ -7,4 +7,3 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 
 | Item (branch / PR / issue) | Machine | Since (UTC) | Note |
 |---|---|---|---|
-| fix/disasm-madak-madmk (disasm_rdna2 VOP2 0x20/0x21) | PC-Joshua | 2026-11-22 15:59 | PR #615 |
