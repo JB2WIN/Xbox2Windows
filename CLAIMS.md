@@ -7,4 +7,3 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 
 | Item (branch / PR / issue) | Machine | Since (UTC) | Note |
 |---|---|---|---|
-| shader/s-bfm (pixel_aot s_bfm_b32) | PC-Joshua | 2026-11-22 15:08 | PR #601 |
