@@ -8,3 +8,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | Item (branch / PR / issue) | Machine | Since (UTC) | Note |
 |---|---|---|---|
 | shader/add-sub-nc (pixel_aot v_add/sub/subrev_nc forms) | PC-Joshua | 2026-11-22 14:06 | PR #582 |
+| cpu/exe-start-termination (#281 follow-up) | PC-Joshua | 2026-11-22 14:28 | PR #589 |
