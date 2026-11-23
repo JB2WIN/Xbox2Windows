@@ -11,3 +11,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | shader/int16-vop3 (16-bit integer VOP3, #669) | PC-Joshua | 2026-11-22 19:33 | design |
 | cmp64 (v_cmp_*_i64/u64, issue) | PC-Joshua | 2026-11-23 04:43 | proposal, awaiting maintainer |
 | shader/vopc-e32-dst (refuse e32 compare SGPR dst) | PC-Joshua | 2026-11-23 06:06 | impl |
+| tests/compute-store-split (#448) | PC-Joshua | 2026-11-23 06:19 | impl |
