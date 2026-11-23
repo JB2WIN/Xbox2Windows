@@ -11,3 +11,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | shader/int16-vop3 (16-bit integer VOP3, #669) | PC-Joshua | 2026-11-22 19:33 | design |
 | shader/mac-legacy (v_mac_legacy_f32) | PC-Joshua | 2026-11-23 02:38 | impl |
 | cmp64 (v_cmp_*_i64/u64, issue) | PC-Joshua | 2026-11-23 04:43 | proposal, awaiting maintainer |
+| shader/s-version (s_version) | PC-Joshua | 2026-11-23 04:44 | impl |
