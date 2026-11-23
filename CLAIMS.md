@@ -12,3 +12,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | shader/s-brev-b32 (s_brev_b32) | PC-Joshua | 2026-11-23 00:59 | impl |
 | shader/v-swap (v_swap_b32) | PC-Joshua | 2026-11-23 01:42 | impl |
 | shader/sopk-waitcnt (s_waitcnt_vmcnt/lgkmcnt/vscnt null) | PC-Joshua | 2026-11-23 02:00 | impl |
+| shader/mac-legacy (v_mac_legacy_f32) | PC-Joshua | 2026-11-23 02:38 | impl |
