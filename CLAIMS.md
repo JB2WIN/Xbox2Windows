@@ -10,3 +10,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | shader/int16-vop3 (pixel_aot 16-bit integer VOP3) | PC-Joshua | 2026-11-22 18:42 | issue #669, waiting for semantics answer |
 | issue #1606 (v_cvt_f32_f64 in pixel_aot) | PC-Joshua | 2026-11-24 14:53 | scope question open |
 | issue #1786 (s_call_b64, s_subvector_loop_* in pixel_aot) | PC-Joshua | 2026-11-24 18:38 | scope question open |
+| startup/gfx2hlsl-swap (v_swap_b32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:22 | claimed in #1723 |
