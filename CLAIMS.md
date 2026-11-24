@@ -8,3 +8,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | Item (branch / PR / issue) | Machine | Since (UTC) | Note |
 |---|---|---|---|
 | shader/int16-vop3 (pixel_aot 16-bit integer VOP3) | PC-Joshua | 2026-11-22 18:42 | issue #669, waiting for semantics answer |
+| issue #1606 (v_cvt_f32_f64 in pixel_aot) | PC-Joshua | 2026-11-24 14:53 | scope question open |
