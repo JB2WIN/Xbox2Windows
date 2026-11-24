@@ -13,3 +13,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/gfx2hlsl-swap (v_swap_b32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:22 | claimed in #1723 |
 | startup/gfx2hlsl-bfm-b64 (s_bfm_b64 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:45 | claimed in #1723 |
 | startup/gfx2hlsl-cmp-class-f16 (v_cmp_class_f16 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:58 | claimed in #1723 |
+| startup/gfx2hlsl-subrev-dpp (v_subrev_f32 DPP in gfx2hlsl, #1996 B) | PC-Joshua | 2026-11-24 23:04 | claimed in #1996 |
