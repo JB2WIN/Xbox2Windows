@@ -12,3 +12,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | issue #1786 (s_call_b64, s_subvector_loop_* in pixel_aot) | PC-Joshua | 2026-11-24 18:38 | scope question open |
 | startup/gfx2hlsl-swap (v_swap_b32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:22 | claimed in #1723 |
 | startup/gfx2hlsl-bfm-b64 (s_bfm_b64 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:45 | claimed in #1723 |
+| startup/gfx2hlsl-cmp-class-f16 (v_cmp_class_f16 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-24 22:58 | claimed in #1723 |
