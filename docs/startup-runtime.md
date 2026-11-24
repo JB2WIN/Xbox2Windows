@@ -1429,6 +1429,10 @@ These are measured on one executable; treat them as hypotheses for others.
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
+- `image_sample_b` in a pixel stage lowers to `SampleBias(sampler, uv, bias)` for 2D, 2D-array and 3D textures; the bias is the
+  first address register. Offset, clamp, compare and gather forms, other stages, code after a branch and a sampler with a
+  LOD bias are refused. `ctest --preset dev --no-tests=error -R '^startup_image_sample_b'` draws bias -1, 0 and +1 on a
+  three-mip array (WARP) and requires mip 0, 1 and 2 (`docs/experiments.md`, "biased image sampling").
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
