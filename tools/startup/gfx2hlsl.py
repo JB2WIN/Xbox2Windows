@@ -804,6 +804,8 @@ class Stage:
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], ops, mods)
         if base.startswith('v_cmp'):
             # Before the VOP1/VOP2 SDWA route below: VOPC SDWA names also end in _sdwa.
             return self.compare(base, ops, mods)
@@ -844,14 +846,76 @@ class Stage:
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
 
+    # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
+    # lane k of its own quad (RDNA 2 ISA, "DPP": a lane reads lane (lane & ~3) | perm[lane & 3] of the row; LLVM 15
+    # AMDGPU DPP quad_perm). A pixel stage's four consecutive lanes are a 2x2 pixel quad (lane = x & 1 | (y & 1) << 1),
+    # which is what SM 6.0 QuadReadLaneAt(value, k) reads, so the stage is compiled as ps_6_0 (Stage.needs_sm6).
+    # Accepted only where the whole quad is proven active: a straight-line pixel stage that ran s_wqm exec, exec and
+    # whose EXEC is still that mask (helper lanes are active, so no source lane is off). bound_ctrl then has
+    # nothing to decide (the source lane is never disabled), so it is accepted and ignored. Everything else a DPP word can say stays refused: other controls (pair
+    # broadcasts, row shifts, mirrors, DPP8), a masked row or bank, fi, and a vertex stage.
+    DPP_TEMP = 256   # hidden VGPR that holds the quad read; the hardware has v0..v255 only
+    DPP_OUTPUT_MODS = ('clamp', 'mul:2', 'mul:4', 'div:2')
+
+    def dpp_broadcast(self, base, ops, mods):
+        fields, rest = {}, []
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('quad_perm', 'row_mask', 'bank_mask', 'bound_ctrl') and value and key not in fields:
+                fields[key] = value
+            elif m in self.DPP_OUTPUT_MODS:
+                rest.append(m)
+            else:
+                raise Unsupported('%s_dpp with modifier %s' % (base, m))
+        lanes = re.fullmatch(r'\[([0-3]),([0-3]),([0-3]),([0-3])\]', fields.get('quad_perm', ''))
+        if not lanes or len(set(lanes.groups())) != 1:
+            raise Unsupported('%s_dpp %s: only quad_perm:[k,k,k,k] broadcasts are lowered'
+                              % (base, fields.get('quad_perm', 'without quad_perm')))
+        if fields.get('row_mask') != '0xf' or fields.get('bank_mask') != '0xf':
+            raise Unsupported('%s_dpp with a partial row_mask or bank_mask' % base)
+        if fields.get('bound_ctrl', '1') != '1':
+            raise Unsupported('%s_dpp bound_ctrl:%s' % (base, fields['bound_ctrl']))
+        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', [])
+                or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
+        if not getattr(self, 'wqm_exec', False):
+            # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
+            # source lane (bound_ctrl / fi), while QuadReadLaneAt would return a helper lane's value.
+            raise Unsupported('%s_dpp without s_wqm exec, exec proving whole-quad activity' % base)
+        if base != 'v_mov_b32' and base not in VEC_F and base not in VEC_U and base not in VEC_U_TO_F:
+            raise Unsupported('DPP form of %s' % base)
+        if len(ops) < 2:
+            raise Unsupported('%s_dpp with %d operands' % (base, len(ops)))
+        token = ops[1]
+        neg = token.startswith('-') and base in VEC_F
+        token = token[1:] if neg else token
+        absolute = token.startswith('|') and token.endswith('|') and base in VEC_F
+        token = token[1:-1] if absolute else token
+        source = reg_range(token)
+        if not source or source[0] != 'v' or source[1] != source[2]:
+            raise Unsupported('%s_dpp source %s is not a VGPR' % (base, ops[1]))
+        # Modifiers apply to the value the lane read, so they stay on the rewritten operand.
+        rewritten = 'v%d' % self.DPP_TEMP
+        rewritten = '|%s|' % rewritten if absolute else rewritten
+        rewritten = '-' + rewritten if neg else rewritten
+        self.needs_sm6 = True
+        self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
+        operands = [ops[0], rewritten] + ops[2:]
+        if base == 'v_mov_b32':
+            if rest or len(operands) != 2:
+                raise Unsupported('v_mov_b32_dpp with %d operands or an output modifier' % len(ops))
+            return self.lower(base, '%s %s' % (base, ', '.join(operands)), operands, [])
+        return self.lower(base, '%s %s %s' % (base, ', '.join(operands), ' '.join(rest)), operands, rest)
+
     # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
     # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
     # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
     # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
-    # proved whole-quad EXEC: the hardware returns 0 or the old value for a source lane whose EXEC bit
-    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Broadcast
-    # and pair permutations, DPP8, row shifts, partial masks and source modifiers stay refused.
+    # proved whole-quad EXEC: the hardware can return 0 or the old value for a source lane whose EXEC bit
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Pair permutations, DPP8, row shifts and partial masks stay refused.
     def dpp(self, base, ops, mods):
+        if any(re.fullmatch(r'quad_perm:\[([0-3]),\1,\1,\1\]', mod) for mod in mods):
+            return self.dpp_broadcast(base, ops, mods)
         perm = None
         for m in mods:
             match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
@@ -2515,6 +2579,10 @@ class Pipeline:
         out += ['    o.pos = p.pos + r.pos - q.pos;', '    return o;', '}']
         return '\n'.join(out) + '\n'
 
+    def ps_profile(self):
+        """The shader profile the pixel stage compiles with: ps_6_0 once it holds a quad read, else ps_5_1."""
+        return 'ps_6_0' if self.ps.needs_sm6 else 'ps_5_1'
+
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
@@ -2602,10 +2670,22 @@ def find_fxc():
 
 
 def find_dxc():
-    """The dxc.exe for a stage that needs shader model 6.0: X2W_DXC, then PATH; None when neither exists."""
+    """The dxc.exe for a pixel stage that needs shader model 6.0, or None. Order: X2W_DXC, the newest
+    KITS_BIN/<version>/x64, then PATH."""
     configured = os.environ.get('X2W_DXC')
     if configured and os.path.isfile(configured):
         return configured
+    versions = []
+    try:
+        for entry in os.listdir(KITS_BIN):
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', entry):
+                versions.append((tuple(map(int, entry.split('.'))), entry))
+    except OSError:
+        pass
+    for _, entry in sorted(versions, reverse=True):
+        candidate = os.path.join(KITS_BIN, entry, 'x64', 'dxc.exe')
+        if os.path.isfile(candidate):
+            return candidate
     import shutil
     return shutil.which('dxc.exe') or shutil.which('dxc')
 
@@ -2646,7 +2726,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
     if fxc and sm6:
         compiler = find_dxc()
         if compiler is None:
-            message = 'dxc not found (X2W_DXC=%s): a quad swap needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            message = 'dxc not found (X2W_DXC=%s): a DPP quad read needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
             open(name + '.fail', 'w').write(message + '\n')
             return message
         profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))

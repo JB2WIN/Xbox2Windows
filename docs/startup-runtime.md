@@ -63,6 +63,24 @@ error, and it leaves one query open at Close. `startup_list_queries_default_{war
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
 `command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
 
+## Depth target on translated draws
+
+List slot 50 (`OMSetRenderTargets`) passes a bound depth-stencil view to the desktop list in the same call
+as the colour targets, and the translated pipeline takes its `DSVFormat` from that view. A depth handle that
+holds 0 maps to no descriptor: the colour targets are bound without depth, and the stand-in logs it and
+counts it in `x2w_d3d12_render_target_stats`. A depth handle in no descriptor heap, or one that is not a
+depth-stencil view, refuses the whole bind (also logged and counted), so nothing is drawn onto targets the
+title did not ask for. `ctest --preset release --no-tests=error -R "^startup_draw_depth_target_" -V` draws a
+near and a far triangle with a depth-tested stream pipeline and reads back the colour and the D32 depth
+values after the fence. With the view bound, the near triangle wins, depth is 0.25 where drawn, and the
+debug layer reports no message. With a zero handle, the far triangle overwrites and depth keeps its clear
+value. With an unknown handle, nothing is drawn. Each unresolved handle is counted once. The `_drop_control`
+draws the bound case with a zero handle and passes only when the intended colour and depth mismatch appears.
+
+Mesh pipelines reach the stand-in only as native desktop-bytecode streams, which must have a pixel stage
+and no depth format. A depth-only mesh pass (no colour target, no pixel stage) is therefore refused when
+the pipeline is created, and no fixture binds a depth target for one.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
@@ -475,7 +493,13 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). Offline mode
+applies to the title's process only. Runtime calls can still be serviced by Gaming Services
+components outside that process, which can use a signed-in Xbox, Store or Gaming Services account.
+Prefer a Windows user or machine with none of those accounts signed in, or the isolated VM in
+[Iterating on start-up runs](#iterating-on-start-up-runs). The live log window already notes that it
+does not establish that all network activity is blocked; see
+[Startup memory accounting](#startup-memory-accounting).
 
 The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
 (`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
@@ -1153,6 +1177,14 @@ Slot 21 reserves the caller's async block on that same XAsync service, with its 
 
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable. `ctest --preset dev --no-tests=error -R '^startup_save_blob_pack'` checks `src/startup_stubs/save_blob_pack.h` directly without a runtime or disk store, including layout, `uint32_t` payload-size and `size_t` overflow refusals, and a negative control for the earlier size check.
 
+### Completion on a manual queue
+
+A completed XAsync operation can sit unconsumed when its block names a queue whose completion port is manual and nobody dispatches that port. `tests/startup_async_manual_completion.cpp` separates this from an operation that is still pending. It starts one synthetic operation on a queue whose work and completion ports are both manual. The provider completes it with an 8-byte payload on another thread. The test then prints four observations for each phase: the Begin return, the non-waiting `XAsyncGetStatus`, `XAsyncGetResultSize` and the callback count with what the callback retrieved. The phases are before completion (`pending`), after the provider thread completes the block, with no work-port callback and no completion-port dispatch (`unpumped`), and after one completion-port dispatch (`dispatched`). The callback count must be 0 until the completion port is dispatched. One dispatch must then run exactly one callback that retrieves the payload, and a second dispatch must find no work. A second block on an immediate queue is the contrast: its callback runs at completion with no dispatch. The `system` variant uses the installed Windows gaming runtime's XAsync service (`073b7dcb`) and prints its status and result-size answers. It accepts `E_PENDING` or `S_OK` before completion-port dispatch and requires `S_OK` after it. It reports a capability skip (77) when the runtime or its XAsync service is unavailable. Queue creation errors after obtaining the service fail the test. One measurement used Gaming Services 39.118.30001.0 (`xgameruntime.dll` 10.0.26100.9656) on Windows 10 build 19045. Before completion, both answers were `E_PENDING` (`0x8000000a`). Once the operation was complete but undispatched, the status was `S_OK`, the result size was 8 bytes and no callback had run. After the dispatched callback retrieved the result, the status stayed `S_OK` and the result size was 0. So a non-waiting status call separates an operation that is still pending from one whose completion has not been dispatched. The `controlled` variant uses a stand-in service in the test. In `inline_control` that stand-in runs the callback inside `XAsyncComplete`, as an immediate port would, and the control must print `FAIL: callback ran before the completion port was dispatched`. [XAsyncGetStatus](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus) · [XTaskQueueDispatch](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch)
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_async_manual_completion_(controlled|system|inline_control)$' -V
+```
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.
@@ -1195,6 +1227,19 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
+- **DPP quad broadcasts.** `quad_perm:[k,k,k,k]` for k = 0, 1, 2 or 3, with full `row_mask` and
+  `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
+  integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
+  quad are one 2 x 2 pixel block (lane = x & 1 | (y & 1) << 1). The lowering applies to straight-line pixel
+  stages that ran `s_wqm exec, exec` with EXEC unchanged since, so no lane of the quad is off; without that proof the broadcast is refused. `QuadReadLaneAt` is shader model
+  6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
+  Kits `bin` folder or on `PATH`), and its vertex stage as `vs_6_0` too, because D3D12 rejects a pipeline
+  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. Swaps, pair broadcasts,
+  row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
+  refused. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast"`: the controls
+  check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
+  fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
+  [#2125](https://github.com/R0Y00/Xbox2Windows/issues/2125)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -1574,9 +1619,10 @@ These are measured on one executable; treat them as hypotheses for others.
   and one line says why (`depth-stencil registers not used (...)`). The decoded state needs a depth
   view: a draw with none bound keeps the desktop default. The stencil reference is list state in
   D3D12, so each draw of such a pipeline with an enabled stencil test calls `OMSetStencilRef` with
-  the decoded value after `SetPipelineState`; with the switch on, the register state wins over list
-  state: it replaces a reference the title recorded before, and
-  whether the console path expects that order is not measured. The pipeline key includes the
+  the decoded value for that draw and restores the guest's list reference immediately after it.
+  A successful list reset restores the default reference of zero. The mixed-pipeline test sets a
+  distinct guest reference before the slot 57 draw, then checks a desktop-state stencil draw on
+  the same list without another reference call. The pipeline key includes the
   decoded description. With the switch off nothing reads the words: no description, key or
   reference changes, and no log line appears. That is checked device-free
   (`startup_depth_state`, with `startup_depth_state_switch_control` as the negative control) and by

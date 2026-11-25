@@ -100,6 +100,54 @@ void* make_slot57(void* device, void* root, const std::vector<char>& vs, const s
     return pso;
 }
 
+struct alignas(8) StageSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_SHADER_BYTECODE shader;
+};
+struct alignas(8) RootSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    ID3D12RootSignature* signature;
+};
+struct alignas(8) DepthStencilSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_DEPTH_STENCIL_DESC desc;
+};
+struct alignas(8) DsvFormatSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    DXGI_FORMAT format;
+};
+struct DepthStream {
+    StageSubobject ps;
+    RootSubobject root;
+    StageSubobject vs;
+    DepthStencilSubobject ds;
+    DsvFormatSubobject dsv_format;
+};
+
+void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vector<char>& vs, const std::vector<char>& ps)
+{
+    D3D12_DEPTH_STENCIL_DESC stencil{};
+    stencil.DepthEnable = FALSE;
+    stencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    stencil.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    stencil.StencilEnable = TRUE;
+    stencil.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    stencil.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    stencil.FrontFace = stencil.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
+    DepthStream stream{
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, stencil},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT_D24_UNORM_S8_UINT},
+    };
+    using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+    auto create = reinterpret_cast<CreateStream>((*static_cast<void***>(device))[86]);
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    void* pso = nullptr;
+    return SUCCEEDED(create(device, &desc, __uuidof(ID3D12PipelineState), &pso)) ? pso : nullptr;
+}
+
 int clear_depth_stencil(ID3D12Device* desktop, ID3D12Resource* tex, float depth, UINT8 stencil)
 {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
@@ -204,6 +252,7 @@ int main(int argc, char** argv)
         UINT8 stencil_clear;
         bool bind_depth;
         std::vector<void*> draws;   // in draw order
+        UINT guest_stencil_ref = 0;
     };
     const std::vector<Case> cases = {
         // Depth. The near triangle (z 0.75, red) is drawn first except in fz_less.
@@ -218,6 +267,10 @@ int main(int argc, char** argv)
         {"st_equal_miss", 1.0f, 0x5a, true, {far_green(st_equal_5b)}},             // stored 0x5A, reference 0x5B: not drawn
         {"st_replace_hit", 1.0f, 0, true, {near_red(st_replace_7), far_green(st_equal_7)}},   // REPLACE 7, then EQUAL 7: green
         {"st_replace_miss", 1.0f, 0, true, {near_red(st_replace_7), far_green(st_equal_8)}},  // REPLACE 7, then EQUAL 8: red stays
+        {"st_ref_restore", 1.0f, 0x5a, true,
+            {near_red(st_equal_5b), create_stream_pso(guest, root, vs_far, ps_green)}, 0x5a},
+        {"st_ref_reset", 1.0f, 0, true,
+            {near_red(st_equal_5b), create_stream_pso(guest, root, vs_far, ps_green)}},
         {"st_refused", 1.0f, 0x5a, true, {far_green(st_ones)}},                    // ONES has no D3D12 form: desktop default, drawn
     };
     for (const auto& c : cases)
@@ -278,6 +331,7 @@ int main(int argc, char** argv)
         invoke(state.list, 22, 1, ptr_arg(&rect));
         invoke(state.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, c.bind_depth ? ptr_arg(&dsv) : 0);
+        if (c.guest_stencil_ref) invoke(state.list, 24, c.guest_stencil_ref);
         for (void* pso : c.draws) {
             invoke(state.list, 25, ptr_arg(pso));
             invoke(state.list, 12, 3, 1);

@@ -30,6 +30,7 @@
 #include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
+#include "startup_stubs/single_element_srv.h"
 
 #include "startup_stubs/slice_footprints.h"
 #include "startup_stubs/present_signature_sampler.h"
@@ -1070,7 +1071,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
 void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
-void reset_viewport_state(Wrapper* self);
+void reset_list_dynamic_state(Wrapper* self);
 void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1348,7 +1349,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     if (SUCCEEDED(hr)) {
-        reset_viewport_state(self);
+        reset_list_dynamic_state(self);
         discard_draw_sampler_heaps(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
     }
@@ -1884,6 +1885,7 @@ struct Pass {
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    UINT stencil_reference = 0;  // last guest OMSetStencilRef on this recording
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -1949,10 +1951,11 @@ void release_targets(Wrapper* self)
     pass = Pass{};
 }
 
-// A reset list starts without a viewport or scissor, whatever the previous recording set.
-void reset_viewport_state(Wrapper* self)
+// A reset list has no viewport or scissor and uses the default stencil reference.
+void reset_list_dynamic_state(Wrapper* self)
 {
     if (!self->own().pass) return;
+    pass_of(self).stencil_reference = 0;
     pass_of(self).viewport_set = false;
     pass_of(self).scissor_set = false;
     pass_of(self).default_viewport_w = pass_of(self).default_scissor_w = 0;
@@ -2450,7 +2453,10 @@ void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 // List slot 24, OMSetStencilRef(reference): list state that the stencil test of the next draws compares against.
 void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
-    if (auto* list = recording(self)) list->OMSetStencilRef(reference);
+    if (auto* list = recording(self)) {
+        pass_of(self).stencil_reference = reference;
+        list->OMSetStencilRef(reference);
+    }
 }
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)

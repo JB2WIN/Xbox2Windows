@@ -23,8 +23,8 @@ desktop device. Expected winners (B = the blue background, nothing drawn):
 
 The depth cases show the winner with reversed-Z, the other result with the switch off and with the compare
 direction wrong; the stencil cases are separate and need the decoded reference (the list's own is 0). The same
-executable renders on WARP and on hardware. Not covered: raster bias, depth bounds, back-face-only state, the
-interplay with an OMSetStencilRef the title records, and the title's clears (#1806).
+executable renders on WARP and on hardware. Not covered: raster bias, depth bounds, back-face-only state, and the
+title's clears (#1806).
 """
 import os
 from pathlib import Path
@@ -50,6 +50,8 @@ EXPECTED = {
     "st_equal_miss": (BLUE, GREEN),
     "st_replace_hit": (GREEN, GREEN),
     "st_replace_miss": (RED, GREEN),
+    "st_ref_restore": (GREEN, GREEN),
+    "st_ref_reset": (GREEN, GREEN),
     "st_refused": (GREEN, GREEN),
 }
 # Pipelines whose state block is taken (switch on), per case: log lines "depth-stencil from state block A".

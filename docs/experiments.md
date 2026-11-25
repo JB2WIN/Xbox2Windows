@@ -3407,6 +3407,34 @@ all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
 
+### Constant-lane scalar spills in bounded mesh
+
+The bounded mesh translator models two wave64s and follows each wave's concrete
+forward control flow. A constant-lane `v_writelane_b32` saves one scalar word
+and `v_readlane_b32` recovers it regardless of EXEC. Each slot belongs to one
+wave and is identified by the VGPR and lane. A reload requires a preceding write
+on the modeled path. Ordinary use of the VGPR between its first spill write and
+a subsequent reload is rejected.
+
+`tests/mesh_lane_spill_check.py` is a hand-authored wave64 fixture. It writes
+and reads lanes 3 and 63 with EXEC cleared, reuses lane 63 for the saved high
+EXEC word, then checks that only lanes 32 through 63 export the expected words.
+It also checks that a uniform expression survives the reload and that swapping
+the two scalar reload lanes fails the value check.
+
+```sh
+python -B tests/mesh_lane_spill_check.py
+ctest --preset dev --no-tests=error -R '^mesh_lane_spill_cpu$' -V
+```
+
+The profile rejects register-selected and out-of-range lanes, unwritten slots,
+and mixed VGPR use within the spill interval, including a register range that
+covers the spill VGPR. Before this change the two instructions went through the
+per-lane vector path: they were refused when a lane was live, but under EXEC = 0
+they were skipped and the reload left its SGPR unwritten. The runtime geometry
+translator now refuses them explicitly. Not measured: the fixture exercises the
+CPU interpreter only; no DXIL was compiled and nothing was drawn.
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
@@ -9758,6 +9786,74 @@ mapping, archive stream discovery and rendered pixels remain separate work.
 The existing prefix probe keeps its diagnostic behavior. No local archive or
 texture payload is used by these checks.
 
+### BCPack lane decoder paths
+
+The startup storage stand-in decodes BCPack streams with `decode_lanes` in
+`src/startup_stubs/bcpack_decoder.h`. All lanes of one stream share one byte cursor. Each cycle, the
+first eight lanes that request a byte receive consecutive stream bytes, in lane order. When a lane asks
+for a byte depends on its rANS state, and so on every symbol it has decoded. One stream therefore cannot
+be split between threads. Within a single cycle the lanes are independent apart from that prefix
+count, so the decoder runs them side by side.
+
+`decode_lanes` uses an AVX2 path (16 lanes as two 8-lane halves) when `cpuid` reports AVX, AVX2 and
+POPCNT and the OS saves the YMM state. Otherwise it uses a scalar loop that runs both phases of a cycle
+in one pass. On every path, header bytes, fragment ends and flushes go through the original per-lane
+step. The original loop is kept as `decode_lanes_reference` for tests. The SIMD code is compiled only by
+MSVC for x64; a clang-cl build has only the scalar path, and its AVX2 tests report 77 with that reason
+rather than a CPU limit.
+
+Each path has its own tests: `bcpack_lanes_scalar`, `bcpack_lanes_avx2` and their
+`bcpack_lanes_python_*` counterparts. A path test compares only that path with the reference and
+returns 77 (capability skip) when the CPU lacks the path. A CPU without AVX2 therefore passes the
+scalar tests and reports the AVX2 tests as skipped.
+
+The comparison uses the two repository vectors, the mode-6 vector and synthetic streams from the
+test-only encoder in `tests/bcpack_encoder.h`. The synthetic streams cover BC1, BC7 and other lane
+tables, flushed and unflushed fragments, and wrong symbol counts. Each stream is tested whole,
+truncated and with single bits flipped. The check requires the same accept or reject decision and the
+same symbols, also on rejection. It also compares every `decode_bcpack` destination byte, including
+for damaged streams that the reference accepts. Inputs end at a no-access page.
+
+The encoder learns the stream order from the decoder's own lane code. So each path is also checked
+against data it did not produce:
+- the lane symbols stored in the repository vectors;
+- the expected bytes in `tests/bcpack_mode6_vector.py` and `tests/startup_stub_consumer.cpp`;
+- the vendored Python decoder (`tests/bcpack_lanes_python_check.py`), on 225 sampled streams.
+
+The `*_drain_control` builds take a wrong DRAIN step and must fail; `bcpack_encoder_window_control`
+must fail as well.
+
+Real fragment lengths are unknown. The repository vectors used at most 150 symbols per fragment; v12
+averages about 72. The benchmark runs at most 150 and at most 4096 symbols per fragment. Each round runs
+every path in turn, the first round is a warm-up and the best of seven is reported. Every path must
+give the same checksum of symbols and destination.
+
+```powershell
+cmake --preset release
+cmake --build --preset release --target bcpack_lanes_check
+.\out\build\release\bcpack_lanes_check.exe tools\_bcpack_rans\vectors --full
+.\out\build\release\bcpack_lanes_check.exe tools\_bcpack_rans\vectors --bench --large
+ctest --preset dev --no-tests=error -R '^bcpack_(lanes|encoder)_' -V
+```
+
+Observed on a Ryzen 7 9800X3D with Windows 11 build 26300 and MSVC Release (`/O2`):
+- `--full` compared 423,874 streams with 0 mismatches on every path. The reference accepted 48,004
+  damaged streams, and every path matched it on each one.
+- `--bench --large` gave the `decode_bcpack` times below for 4 MiB destinations (524,288 BC1 or
+  262,144 BC7 blocks), with the lane-decode rate in parentheses.
+
+| Stream | Reference | Scalar | AVX2 |
+|---|---|---|---|
+| BC1, at most 150 symbols per fragment | 161 ms (24.5 ns/symbol) | 127 ms (18.9) | 46 ms (5.9) |
+| BC1, at most 4096 | 119 ms (17.4) | 91 ms (13.0) | 31 ms (3.7) |
+| BC7, at most 150 | 283 ms (27.0) | 232 ms (20.8) | 107 ms (6.0) |
+| BC7, at most 4096 | 227 ms (20.2) | 181 ms (15.0) | 89 ms (4.0) |
+
+End to end, the scalar loop is 1.2-1.3x faster than the reference; the lane step alone is
+1.3-1.4x faster here and up to 2x on the 700-block vector. AVX2 is 3.5-3.8x faster for BC1 and
+2.6x for BC7. BC7 block reconstruction, unchanged, now takes about half of the BC7 time. The AVX2
+gain was measured on Zen 5, which has fast gathers; CPUs with slow gathers are unmeasured.
+
 ### Reading logical ranges and probing structured resources
 
 `tools/paged_resource.py` reads a logical byte range from an open archive and a supplied segment map. Each segment gives a physical offset, stored byte count excluding padding, decoded byte count, and codec. Raw and zlib segments may be mixed. The reader verifies the complete compressed stream and decoded size before returning bytes from it. Reads that touch an unknown codec fail. Segments after it remain independently addressable.
@@ -12170,6 +12266,32 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
 
+### Single-element 2D and 3D textures published by address
+
+Device slot 70 publishes a 1×1 2D or 1×1×1 3D texture by address, without a resource object. It must have one mip, one sample, default or 64 KiB alignment, and a plain colour format whose element is one texel of 1 to 16 bytes. R8_UNORM keeps its placed-texture path. The view must name the whole texture with the default mapping. The only element is read from offset 0 of the guest memory. That holds for layout UNKNOWN, the value seen on such views, and for linear (`0x100`). For the swizzle modes AMD addrlib defines without pipe/bank XOR (`0x101`, `0x102`, `0x105`, `0x106`, `0x109`, `0x10A`) it is inferred from the source, not run: a swizzle address is a block offset plus a bit pattern of the coordinates, both zero at the origin, and a single mip sits at offset 0 (`Gfx10Lib::ComputeSurfaceInfoMacroTiled` at the pinned [revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)). Reserved modes (`0x103`, `0x104`, `0x107`, `0x108`, `0x10B`) and XOR modes (`0x110` and up) stay refused. So do larger shapes, mip chains, arrays, multisampling, other alignments, block-compressed formats and render-target, depth or UAV flags. A view over a live render-target, depth or UAV resource that covers the address (its base, or inside its known allocation size) is refused with `reason=gpu_written_resource`, because that resource is written on the desktop side. The translated draw uploads the texel through the footprint path and rehashes it on every bind, so a write between two draws is seen.
+
+Limits: the GPU-written check runs when the view is published, so it does not see a resource created later. The check compares the entire texel with the live resource range (only its base byte if the allocation size is unknown). Published address-only views are never evicted (as for the BC views above).
+
+`startup_single_element_srv` checks 50 descriptions without a device; its `xor_control` expects layout `0x115` to be accepted and must fail. `startup_address_single_element_{warp,hardware}` draws eight columns per dimension from a translated shader that loads texel zero. The columns are:
+
+- RGBA8 at layouts 0 and `0x105`;
+- the first texel rewritten and published again;
+- the texel rewritten without a new publication, in the same frame;
+- B8G8R8A8 and R16G16B16A16_FLOAT;
+- 64 KiB alignment.
+
+Before the fourth column, fifteen refused calls name memory holding another texel; the previous view must stay. On Windows 11 build 26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP (10.0.26100.10068) matched all 32 RGBA pixels per dimension. Each of these changes fails the WARP draw:
+
+- reverting the runtime change, which makes column 0 read zero;
+- accepting 2x1, two mips or layout `0x115` (column 3 reads the other texel);
+- dropping the per-bind rehash (column 3 reads the previous texel);
+- checking only the base of a GPU-written resource (column 3 reads the other texel).
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_single_element_srv_check d3d12_xs_shim
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(single_element_srv|address_single_element_)'
+```
+
 ### Placed vertex buffers consumed by a translated draw
 
 `startup_placed_vertex_{hardware,warp}` opens two real slot-133 buffers on CPU-visible allocations with bases separated by 1 TiB. Slot 48 supplies the full guest address and byte length to a translated vertex-stream binding. The shader can read from the registered GPU buffer directly when the resource aliases the guest memory, the length covers whole DWORDs and the start is aligned to 16 bytes. Views crossing a registered boundary or overlapping multiple live placements on the list's device produce a null descriptor before staging. Final wrapper release removes the placement from binding lookup.
@@ -12310,6 +12432,12 @@ The [MASM fixture](../tests/cpu/vex_parity.asm) and [differential check](../test
 ```powershell
 ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 ```
+
+### gfx1013 pixel DPP16 quad broadcast
+
+The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted only in a straight-line pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. Without that proof the instruction is refused, as are swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
+
+Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal and the missing `s_wqm`; the WARP and hardware draws compare all 256 pixels of two fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
 
 ## Startup root signature changes
 

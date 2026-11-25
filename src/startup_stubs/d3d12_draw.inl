@@ -734,7 +734,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
-    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+    // An address-only single-element texture (2D or 3D) uploads its one texel through the footprint path.
+    const bool single = resource->own().tiled_address_srv && x2w_startup::single_element_bytes(desc) != 0;
+    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D || single ||
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
     {
         static LONG reasons;
@@ -775,13 +777,14 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return;
     }
-    if (tiled && !tiled_chain && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !tiled_chain && !single && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size() : stride * (slices - 1) + slice_total;
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
-        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
+    const bool recheck = single || ((tiled_address || tiled_chain) ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
     if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
@@ -812,7 +815,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
                 plan.upload(list, texture, upload_ring, mips, slices, slice, i, offset);
             }
         }
-    } else if (tiled) {
+    } else if (tiled && !single) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
@@ -1194,8 +1197,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->SetPipelineState(pipeline);
     // X2W_DEPTH_STATE: the reference of the decoded stencil test is list state in D3D12. It replaces the one a
     // preceding OMSetStencilRef set, for draws of this pipeline only when a depth view is bound.
-    if (bound->depth_from_registers && bound->has_stencil_ref && pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN)
-        list->OMSetStencilRef(bound->stencil_ref);
+    const bool scoped_stencil_ref = bound->depth_from_registers && bound->has_stencil_ref &&
+                                    pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN &&
+                                    bound->stencil_ref != pass.stencil_reference;
+    if (scoped_stencil_ref) list->OMSetStencilRef(bound->stencil_ref);
     list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
     if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
@@ -1223,6 +1228,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
         drawn = true;
     }
+    if (scoped_stencil_ref) list->OMSetStencilRef(pass.stencil_reference);
     if (drawn) draw_dump_after(self, list, tr->key, count);
     ReleaseSRWLockExclusive(&draw_lock);
     if (first_calls(tr->logged_draws, 10) || (count > 100 && first_calls(tr->logged_large, 12))) {

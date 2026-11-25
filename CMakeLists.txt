@@ -627,6 +627,54 @@ add_test(NAME startup_storage_refused_reuse_accept_refused_control
 set_tests_properties(startup_storage_refused_reuse startup_storage_refused_reuse_accept_refused_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_refused_reuse_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: R1 destination taken as data matches the stream prefix in 0 of 4096 byte")
+
+# Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
+# symbols. Interleaving with a 7-byte cycle budget is the negative control.
+add_executable(bcpack_encoder_check tests/bcpack_encoder_check.cpp)
+target_compile_features(bcpack_encoder_check PRIVATE cxx_std_17)
+target_include_directories(bcpack_encoder_check PRIVATE src)
+add_test(NAME bcpack_encoder_roundtrip COMMAND bcpack_encoder_check)
+add_test(NAME bcpack_encoder_window_control COMMAND bcpack_encoder_check --mutate window)
+set_tests_properties(bcpack_encoder_roundtrip bcpack_encoder_window_control PROPERTIES TIMEOUT 120)
+set_tests_properties(bcpack_encoder_window_control PROPERTIES WILL_FAIL TRUE)
+# Each decode_lanes path against the original cycle loop on whole, truncated and bit-flipped streams
+# (tests/bcpack_lanes_check.cpp), one test per path; 77 means this CPU lacks that path. The control
+# build takes a wrong short DRAIN step at the home state and must fail on every path.
+foreach(variant IN ITEMS check control)
+    add_executable(bcpack_lanes_${variant} tests/bcpack_lanes_check.cpp)
+    target_compile_features(bcpack_lanes_${variant} PRIVATE cxx_std_17)
+    target_include_directories(bcpack_lanes_${variant} PRIVATE src)
+    target_compile_definitions(bcpack_lanes_${variant} PRIVATE X2W_BCPACK_LANE_TESTS)
+endforeach()
+target_compile_definitions(bcpack_lanes_control PRIVATE X2W_BCPACK_LANES_CONTROL)
+set(bcpack_lane_paths scalar avx2)
+# Each path is also checked against outside anchors: the symbols stored in the repository vectors, the
+# expected bytes in tests/bcpack_mode6_vector.py and tests/startup_stub_consumer.cpp, and the vendored
+# Python decoder on a sample of streams (tests/bcpack_lanes_python_check.py).
+foreach(path IN LISTS bcpack_lane_paths)
+    add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors"
+             --path ${path} --consumer "${CMAKE_SOURCE_DIR}/tests/startup_stub_consumer.cpp")
+    add_test(NAME bcpack_lanes_${path}_drain_control
+             COMMAND bcpack_lanes_control "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+    set(bcpack_lane_tests bcpack_lanes_${path} bcpack_lanes_${path}_drain_control)
+    if(EXISTS "${INTAKE_PYTHON}")
+        foreach(variant IN ITEMS check control)
+            set(name bcpack_lanes_python_${path})
+            if(variant STREQUAL control)
+                set(name bcpack_lanes_python_${path}_drain_control)
+            endif()
+            add_test(NAME ${name} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/bcpack_lanes_python_check.py"
+                     "$<TARGET_FILE:bcpack_lanes_${variant}>" "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+            list(APPEND bcpack_lane_tests ${name})
+        endforeach()
+        set_tests_properties(bcpack_lanes_python_${path}_drain_control PROPERTIES
+            PASS_REGULAR_EXPRESSION "${path} path, [0-9]+ bytes, widths .*: Python accepts, C\\+\\+ rejects")
+    endif()
+    set_tests_properties(${bcpack_lane_tests} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Both the vector symbols and the reference sweep must catch the control build.
+    set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES PASS_REGULAR_EXPRESSION
+        "${path} path: synthetic_11 lane [0-9]+ differs from the vector's symbols.*result: anchors failed, [1-9][0-9]* mismatches")
+endforeach()
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
@@ -760,6 +808,17 @@ target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
 add_executable(startup_gamesave_read_async tests/startup_gamesave_read_async.cpp)
 target_include_directories(startup_gamesave_read_async PRIVATE src)
 target_compile_features(startup_gamesave_read_async PRIVATE cxx_std_17)
+add_executable(startup_async_manual_completion tests/startup_async_manual_completion.cpp)
+target_compile_features(startup_async_manual_completion PRIVATE cxx_std_17)
+foreach(scheduler IN ITEMS controlled system)
+    add_test(NAME startup_async_manual_completion_${scheduler} COMMAND startup_async_manual_completion ${scheduler})
+    set_tests_properties(startup_async_manual_completion_${scheduler} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(startup_async_manual_completion_system PROPERTIES SKIP_RETURN_CODE 77)
+# Control: a stand-in that runs the callback inside Complete must fail the unpumped check.
+add_test(NAME startup_async_manual_completion_inline_control COMMAND startup_async_manual_completion inline-control)
+set_tests_properties(startup_async_manual_completion_inline_control PROPERTIES TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "FAIL: callback ran before the completion port was dispatched")
 add_executable(startup_runtime_local tests/startup_runtime_local.cpp)
 target_include_directories(startup_runtime_local PRIVATE src)
 target_compile_features(startup_runtime_local PRIVATE cxx_std_17)
@@ -885,6 +944,11 @@ target_link_libraries(startup_stream_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
 add_executable(startup_slot57_depth tests/startup_slot57_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_slot57_depth PRIVATE cxx_std_17)
 target_link_libraries(startup_slot57_depth PRIVATE d3d12_xs_shim d3d12 dxgi)
+# Depth target binding for translated draws (list slot 50, #1999 item D): depth values and debug-layer
+# messages after the fence, and an unresolved depth handle.
+add_executable(startup_draw_depth_target tests/startup_draw_depth_target.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
+target_compile_features(startup_draw_depth_target PRIVATE cxx_std_17)
+target_link_libraries(startup_draw_depth_target PRIVATE d3d12_xs_shim d3d12 dxgi)
 
 # Console queue Wait (slot 17) waits on the GPU instead of signalling the fence.
 add_executable(startup_queue_wait tests/startup_queue_wait.cpp)
@@ -1958,6 +2022,14 @@ target_include_directories(startup_bc64_supports_check PRIVATE src)
 add_test(NAME startup_bc64_supports COMMAND startup_bc64_supports_check)
 add_test(NAME startup_bc64_supports_layout_control COMMAND startup_bc64_supports_check --mutate layout)
 set_tests_properties(startup_bc64_supports_layout_control PROPERTIES WILL_FAIL TRUE)
+# Which descriptions take the single-element memory SRV path (src/startup_stubs/single_element_srv.h), without
+# a device. The mutated run expects an XOR layout to be accepted and is the negative control.
+add_executable(startup_single_element_srv_check tests/startup_single_element_srv_check.cpp)
+target_compile_features(startup_single_element_srv_check PRIVATE cxx_std_17)
+target_include_directories(startup_single_element_srv_check PRIVATE src)
+add_test(NAME startup_single_element_srv COMMAND startup_single_element_srv_check)
+add_test(NAME startup_single_element_srv_xor_control COMMAND startup_single_element_srv_check --mutate xor)
+set_tests_properties(startup_single_element_srv_xor_control PROPERTIES WILL_FAIL TRUE)
 # Slot-10 tile plan for layout 0x10a (src/startup_stubs/tile64_plan.h) without a device: tile shapes,
 # accepted descriptions and hand-worked plans. The mutated runs are negative controls.
 add_executable(startup_tile64_plan_check tests/startup_tile64_plan_check.cpp)
@@ -2327,6 +2399,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # reference; floating-point SDWA forms and unsupported modifiers are refused. The draws are registered below.
     add_test(NAME startup_gfx2hlsl_vopc_sdwa COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py")
+    # DPP16 quad broadcasts quad_perm:[k,k,k,k] (#2125): lowered to QuadReadLaneAt, so the pixel stage compiles as
+    # ps_6_0; the controls and refusals run here, the draws below compare every pixel with a CPU reference.
+    add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_broadcast_check.py")
     # f32 lg/nlg ordered for NaN (#1920): every f32 condition, e32 and e64 under every neg/abs, evaluated over
     # +-0, denormals, +-1, +-max, +-inf and NaNs against the ISA reference; the old != lowering must fail.
     add_test(NAME startup_gfx2hlsl_f32_lg COMMAND "${INTAKE_PYTHON}" -B
@@ -2492,6 +2568,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_vopc_sdwa_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_vopc_sdwa_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_gfx2hlsl_dpp_quad_broadcast_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_dpp_quad_broadcast_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_dpp_quad_broadcast_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME startup_gfx2hlsl_sdwa_cvt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
@@ -2603,6 +2683,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_slot57_depth_check.py"
             "$<TARGET_FILE:startup_slot57_depth>" "${backend}")
         set_tests_properties(startup_slot57_depth_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # The drop control draws the bound case with an unresolved depth handle and must fail only its picture.
+        add_test(NAME startup_draw_depth_target_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+            "$<TARGET_FILE:startup_draw_depth_target>" "${backend}" check)
+        add_test(NAME startup_draw_depth_target_drop_control_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_draw_depth_target_check.py"
+            "$<TARGET_FILE:startup_draw_depth_target>" "${backend}" drop)
+        set_tests_properties(startup_draw_depth_target_${backend} startup_draw_depth_target_drop_control_${backend}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(compiler IN ITEMS fxc dxc)
             add_test(NAME startup_mrt_${compiler}_${backend} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_mrt_check.py"
@@ -2645,6 +2734,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_address_single_element_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_single_element_srv_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
@@ -6778,6 +6871,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_geometry_check.py")
     add_test(NAME mesh_dynamic_aot_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_check.py")
+    add_test(NAME mesh_lane_spill_cpu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_lane_spill_check.py")
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_amplification_refusal_check.py")
     set_tests_properties(mesh_amplification_refusal PROPERTIES TIMEOUT 30)
