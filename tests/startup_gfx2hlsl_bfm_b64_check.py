@@ -1,6 +1,10 @@
 """s_bfm_b64 in tools/startup/gfx2hlsl.py (census issue #1723).
 
-usage: startup_gfx2hlsl_bfm_b64_check.py
+usage: startup_gfx2hlsl_bfm_b64_check.py [draw <dxc> <offscreen_check> <warp|hardware> [fxc]]
+
+  (no arguments)  translation controls and the CPU evaluation of the emitted text, pure Python
+  draw            additionally draw the translated pair on a desktop adapter (WARP or hardware), compile the pixel
+                  stage with FXC ps_5_1 when given and with DXC ps_6_0, and compare the read-back words
 
 `s_bfm_b64` had no lowering and was refused. RDNA 2 ISA (SOP2 opcode 37, `isa/rdna2_isa.txt` "S_BFM_B64"):
 `D.u64 = ((1ULL << S0.u[5:0]) - 1) << S1.u[5:0]`. Both sources are 32-bit and only their low six bits count; a
@@ -17,6 +21,14 @@ from a bit loop over the ISA description, not from the lowering's expressions. M
 63, offset masked to five bits, width 0 reading all ones) must read a wrong word and are applied to the translated
 text only.
 
+The draw mode (review of #2007) takes the evaluator out of the loop: the compiler's own treatment of `shl64`, the
+`bw >= 32u ? ... : ...` selects and `uint2` is read back from the render target. Width and offset are root constants
+(s8 and s9 of the pixel stage), so neither compiler can fold them. One draw computes `s_bfm_b64 s[20:21], s8, s9` and
+the swapped `s_bfm_b64 s[22:23], s9, s8` and exports the four words. The expected words are the bit-loop reference.
+Two negative controls must show in the draw: a reference that wraps the bits past bit 63 instead of dropping them,
+and a mutated lowering (width 0 reads all ones). The pixel stage is built from instruction words made with the
+encoder below and read back through the decoder, so no assembler is needed.
+
 A source SGPR that holds a lane mask (a compare result) is refused before either destination word or its mask flag changes,
 with and without the destination aliasing the source. After #1931 both written words are proven uniform only when both sources
 are, and an older proof for s[d] or s[d+1] is dropped, so a later v_readfirstlane_b32 cannot use it.
@@ -25,6 +37,7 @@ import os
 import re
 import struct
 import sys
+import types
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, '..', 'tools'))
@@ -364,6 +377,16 @@ def snapshot(stage):
     return (list(stage.lines), dict(stage.sym), set(stage.masks), set(stage.varying_s), set(stage.used_s))
 
 
+def refused_after(*instructions):
+    """True when the last instruction is refused after running the earlier ones on a tracked stage."""
+    stage = TrackedStage().run(*instructions[:-1])
+    try:
+        stage.run(instructions[-1])
+    except G.Unsupported:
+        return True
+    return False
+
+
 CMP = 'v_cmp_lt_f32_e64 %s, v0, v1'
 for label, cmp_dst, bfm in (
         ('compare mask as width', 's2', 's_bfm_b64 s[20:21], s2, s3'),
@@ -389,6 +412,52 @@ for asm in ('s_bfm_b64 s[20:21], s2, s3', 's_bfm_b64 s[20:21], s20, s3', 's_bfm_
 # A mask destination (not a source) loses its flag: the pair is a number afterwards.
 stage = TrackedStage().run(CMP % 's20', 's_bfm_b64 s[20:21], s2, s3')
 check('a mask destination that is not a source loses its flag', 20 not in stage.masks and 21 not in stage.masks)
+
+# A lane mask in the high word of the destination pair is a number after the write (review of #2007, the survived
+# mutation of `self.masks.discard(d + 1)`): s21 is a compare result, s_bfm_b64 overwrites s[20:21], and s21 is then
+# read as a source. That read must be accepted and must use the word written by the first instruction.
+stage = TrackedStage().run(CMP % 's21')
+check('control: the compare result in s21 is a lane mask before the write', 21 in stage.masks)
+check('control: reading s21 while it is still a lane mask is refused', refused_after(CMP % 's21', 's_bfm_b64 s[22:23], s2, s21'))
+stage = TrackedStage().run(CMP % 's21', 's_bfm_b64 s[20:21], s2, s3')
+check('a lane mask in s[d+1] loses its flag when s_bfm_b64 writes the pair', 21 not in stage.masks and 20 not in stage.masks,
+      repr(stage.masks))
+check('s21 is read as a number after the write', not refused_after(CMP % 's21', 's_bfm_b64 s[20:21], s2, s3',
+                                                                'v_mov_b32_e32 v7, s21', 's_bfm_b64 s[22:23], s2, s21'))
+nit_stage = TrackedStage().run(CMP % 's21', 's_bfm_b64 s[20:21], s2, s3', 's_bfm_b64 s[22:23], s2, s21')
+# The compare line is HLSL over vector registers; run only the two scalar blocks.
+env, interp = {'s2': 33, 's3': 31}, Interp(COMMON)
+for line in [l for l in nit_stage.lines if 'shl64(' in l]:
+    interp.run(line, env)
+check('evaluated: s[22:23] = bfm(33, high word of bfm(33, 31))',
+      (env['s22'], env['s23']) == pair(reference(33, pair(reference(33, 31))[1])), repr(env))
+# The mutation itself: the same lowering without `self.masks.discard(d + 1)` keeps s21 a lane mask, so the read is
+# refused. The patched source is executed as a separate module; the check fails if the mutation does not apply.
+SOURCE = open(os.path.join(here, '..', 'tools', 'startup', 'gfx2hlsl.py'), encoding='utf-8').read()
+DISCARD = '        self.masks.discard(d + 1)\n'
+body = SOURCE[SOURCE.index('def op_s_bfm_b64'):]
+body = body[:body.index('\n    def ', 10)]
+check('mutation applies: op_s_bfm_b64 holds exactly one discard of d + 1', body.count(DISCARD) == 1)
+mutant_source = SOURCE.replace(body, body.replace(DISCARD, ''))
+check('mutation changes the source', mutant_source != SOURCE)
+mutant = types.ModuleType('gfx2hlsl_mutant')
+mutant.__file__ = G.__file__
+exec(compile(mutant_source, 'gfx2hlsl_mutant.py', 'exec'), mutant.__dict__)
+
+
+class MutantStage(mutant.Stage):
+    __init__ = TrackedStage.__init__
+    run = TrackedStage.run
+
+
+for label, module_stage, expect_refused in (('unmutated', TrackedStage, False), ('without discard(d + 1)', MutantStage, True)):
+    try:
+        module_stage().run(CMP % 's21', 's_bfm_b64 s[20:21], s2, s3', 's_bfm_b64 s[22:23], s2, s21')
+        got_refused = False
+    except (G.Unsupported, mutant.Unsupported):
+        got_refused = True
+    check('%s: the number read of s21 after the write is %s' % (label, 'refused' if expect_refused else 'accepted'),
+          got_refused == expect_refused)
 
 # ---- 9. both written words carry a fresh uniformity proof (#1931) ----------------------------------------------------
 READ = 'v_readfirstlane_b32 s9, v7'
@@ -428,6 +497,128 @@ for word in (20, 21):
     check('control: a later uniform write re-proves s%d' % word, got == 'accepted', got)
     stage = TrackedStage().run(VARYING, 's_bfm_b64 s[20:21], s3, s5', 's_bfm_b64 s[20:21], 5, 3')
     check('control: constant sources re-prove s%d' % word, read_word(stage, word) == 'accepted')
+
+# ---- 10. desktop draw: the compiler's own shl64, select and uint2 handling, read back (review of #2007) ----------
+def container(parts):
+    """DXBC header (hash zeroed) followed by (fourcc, body) parts."""
+    base = 32 + 4 * len(parts)
+    offsets, body = [], b''
+    for fourcc, data in parts:
+        offsets.append(base + len(body))
+        body += fourcc + struct.pack('<I', len(data)) + data
+    return b'DXBC' + bytes(16) + struct.pack('<III', 1, base + len(body), len(parts)) + struct.pack(
+        '<%dI' % len(offsets), *offsets) + body
+
+
+# One root-constant parameter of two words: s8 (width) and s9 (offset) in both stages, run-time values the compiler
+# cannot see. Layout as the checked-in parser reads it: version, parameter count, parameter table at byte 24, no
+# samplers, then the (type 1, visibility 0, offset 36) entry and (register 0, space 0, count 2).
+ROOT = container([(b'RTS0', struct.pack('<6I', 1, 1, 24, 0, 36, 0) + struct.pack('<3I', 1, 0, 36)
+                   + struct.pack('<3I', 0, 0, 2))])
+VS_WORDS = bytes.fromhex(  # the recorded full-screen triangle that exports param0 (tests/startup_flat_param_check.py)
+    'ff02067e00004040' 'ff02147e000040c0' '8100847d' 'f3060202' '8200847d' 'f2140402' 'f202087e' '80020a7e'
+    '81020c7e' '82020e7e' 'ff02107e0100c07f' 'ff02127e01000080' 'cf0800f801020504' '0f0200f806070809' '000081bf')
+VOP1_MOV = 1
+
+
+def ps_instructions():
+    """s_bfm_b64 s[20:21], s8, s9; s_bfm_b64 s[22:23], s9, s8; v12..v15 = s20..s23; exp mrt0 v12..v15; s_endpgm."""
+    words = [encode(20, 8, 9), encode(22, 9, 8)]
+    words += [struct.pack('<I', 0x7e000000 | (12 + i) << 17 | VOP1_MOV << 9 | (20 + i)) for i in range(4)]
+    words.append(bytes.fromhex('0f1800f80c0d0e0f' '000081bf'))
+    return b''.join(words)
+
+
+DRAW_WIDTHS, DRAW_OFFSETS = (0, 1, 31, 32, 33, 63), (0, 1, 31, 32, 63)
+# Source bits above [5:0] are ignored: 64 reads as 0, 0x41 as 1, 0xffffffa1 as 33, 0xffffff9f as 31.
+DRAW_CASES = [(w, o) for w in DRAW_WIDTHS for o in DRAW_OFFSETS] + [(64, 0), (0x41, 0xc1), (0xffffffa1, 3),
+                                                                    (5, 0xffffff9f)]
+
+
+def words_of(w, o):
+    """Expected export: s[20:21] = bfm(w, o), s[22:23] = bfm(o, w), each as the low word then the high word."""
+    return pair(reference(w, o)) + pair(reference(o, w))
+
+
+def wrapped_reference(w, o):
+    """The wrong reference of the negative control: bits shifted past bit 63 wrap into the low word instead of
+    being dropped (a missing cap at bit 63)."""
+    width, offset = w & 63, o & 63
+    full = ((1 << width) - 1) << offset
+    return (full & ((1 << 64) - 1)) | (full >> 64)
+
+
+def wrapped_words(w, o):
+    return pair(wrapped_reference(w, o)) + pair(wrapped_reference(o, w))
+
+
+def text_of(values):
+    return ','.join('%08x' % v for v in values)
+
+
+def draw_bfm(renderer, adapter, vs, ps, w, o, expected):
+    import subprocess
+    constants = {1: w & MASK, 2: o & MASK}  # ud1, ud2 (ud0 is the rectangle switch and stays 0)
+    entry = text_of([constants.get(i, 0) for i in range(4)])
+    run = subprocess.run([renderer, adapter, '--startup-flat-param', str(vs), str(ps), text_of(expected), entry],
+                         capture_output=True, text=True)
+    if run.returncode == 77:
+        print(run.stdout + run.stderr)
+        sys.exit(77)
+    return run
+
+
+def check_draw(dxc, renderer, adapter, fxc=None):
+    import tempfile
+    from pathlib import Path
+    sys.path.insert(0, here)
+    from startup_flat_param_check import compile_hlsl
+    pipe = G.Pipeline(VS_WORDS, ps_instructions(), ROOT)
+    check('draw: the entry constants sit at ud0 (rect) and ud1, ud2 (width, offset)',
+          pipe.uds[:3] == [('rect',), ('rootconst', 0, 0), ('rootconst', 0, 1)], repr(pipe.uds))
+    vs_text, ps_text = pipe.hlsl_vs(), pipe.hlsl_ps()
+    check('draw: the pixel stage computes both pairs from run-time constants',
+          ps_text.count('= shl64(') == 2 and 'ud1' in ps_text and 'ud2' in ps_text)
+    mutated_text = ps_text.replace('bw >= 32u ?', 'bw >= 32u || bw == 0u ?')
+    check('draw: the mutated pixel stage differs from the translation', mutated_text != ps_text)
+    compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        for kind, compiler, vs_profile, ps_profile in compilers:
+            vs = compile_hlsl(compiler, kind, vs_text, 'vs_bfm_%s' % kind, vs_profile, directory)
+            good = compile_hlsl(compiler, kind, ps_text, 'ps_bfm_%s' % kind, ps_profile, directory)
+            bad = compile_hlsl(compiler, kind, mutated_text, 'ps_bfm_mutated_%s' % kind, ps_profile, directory)
+            for w, o in DRAW_CASES:
+                expected = words_of(w, o)
+                run = draw_bfm(renderer, adapter, vs, good, w, o, expected)
+                if run.returncode:
+                    raise AssertionError('%s width %#x offset %#x expected %s\n%s\n%s' % (
+                        kind, w, o, text_of(expected), run.stdout, run.stderr))
+                print('%s width %#x offset %#x: %s' % (kind, w, o, text_of(expected)), flush=True)
+            # Negative control 1: a reference without the cap at bit 63 must not match what the compiled code returns.
+            for w, o in ((33, 63), (63, 63), (33, 32), (63, 33)):
+                wrong = wrapped_words(w, o)
+                check('%s: the uncapped reference differs from the ISA reference for width %d offset %d' % (kind, w, o),
+                      wrong != words_of(w, o))
+                run = draw_bfm(renderer, adapter, vs, good, w, o, wrong)
+                real = 'actual=%s' % text_of(words_of(w, o))
+                if run.returncode == 0 or real not in run.stderr:
+                    raise AssertionError('%s uncapped reference was not rejected for width %d offset %d\n%s\n%s' % (
+                        kind, w, o, run.stdout, run.stderr))
+                print('%s uncapped reference: fails as expected, reads %s' % (kind, text_of(words_of(w, o))), flush=True)
+            # Negative control 2: the mutated lowering (width 0 reads all ones) must read different words.
+            for w, o, got in ((0, 0, (0xffffffff, 0, 0xffffffff, 0)), (0, 5, (0xffffffe0, 0x1f, 0x1f, 0))):
+                run = draw_bfm(renderer, adapter, vs, bad, w, o, words_of(w, o))
+                if run.returncode == 0 or 'actual=%s' % text_of(got) not in run.stderr:
+                    raise AssertionError('%s mutated lowering did not read %s for width %d offset %d\n%s\n%s' % (
+                        kind, text_of(got), w, o, run.stdout, run.stderr))
+                print('%s mutation (width 0 reads all ones): fails as expected, reads %s' % (kind, text_of(got)), flush=True)
+
+
+if len(sys.argv) > 1:
+    if sys.argv[1] != 'draw' or len(sys.argv) not in (5, 6):
+        raise SystemExit(__doc__)
+    check_draw(*sys.argv[2:])
 
 if failures:
     print('FAIL')
