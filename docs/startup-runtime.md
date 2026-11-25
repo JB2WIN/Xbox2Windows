@@ -1265,6 +1265,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
+| `X2W_D3D12_RELEASE_RETIRED=1` | opt-in: frees the desktop object of a committed resource without title memory after its final guest release and after the queue work submitted before that release has completed ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1327,11 +1328,46 @@ those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
 
+`X2W_D3D12_RELEASE_RETIRED=1` changes that lifetime for one class of
+resource. A committed texture or buffer is queued at its final guest release:
+those created by device slot 27 or 127 (with or without an `XMemAlloc` hook
+block as title memory), slot 133 textures (always a committed stand-in) and
+slot 133 buffers that fell back to a committed copy. Every desktop command queue the stand-in created owns a private
+desktop fence, and the release signals each one, so the recorded values lie
+behind all work submitted to that queue so far, from whichever code path. Once
+every queue has reached its value, which `ExecuteCommandLists` and `Present`
+check without waiting, the stand-in clears the wrapper's desktop pointer,
+drops its own desktop reference, removes the pointer from the per-pointer
+caches that outlive a recording and removes the wrapper from the title-address
+index, so a resource placed later at the same title address meets only the new
+wrapper. The final guest release already leaves the placement index and ends
+the mesh lease of the wrapper, as without the switch. The object is destroyed when no other
+reference remains, and its budget ticket then leaves the retained column. The
+wrapper itself stays allocated, because the title may still hold the pointer.
+Resources placed on a shared heap (slot 29, and slot 133 buffers aliased onto
+an opened heap), reserved resources, tiled address textures, heaps and internal
+resources keep the behavior described above. The log shows the first eight
+freed resources and then every thousandth as
+`x2w-d3d12 retired resources freed N (bytes B)`. A guest that
+uses a resource after releasing it, or releases it while a recording that
+uses it is still open, is not supported with the switch.
+
 The source-built fixture reads the process-wide counters through
 `x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
 and slot 148 page retirement after queue completion. See
 [D3D12 budget accounting](experiments.md#d3d12-budget-accounting) for the test
-command.
+command. `startup_resource_retire_warp` and `startup_resource_retire_hardware`
+queue a copy of two textures and two buffers behind an unsignalled fence,
+release them, and require that the retained column still holds them while the
+queue waits (negative control), then returns to the baseline after the fence
+is signalled. They also release a slot 133 texture and buffer on title memory,
+and then place a new texture at the same title address: the
+`x2w_d3d12_address_lookup` probe must report one index entry, the new wrapper.
+A resource that stays referenced remains live, and a resource released on an
+idle queue is freed without further GPU work. The
+`startup_resource_retire_off_*` cases run without the switch and require the
+previous behavior, retained until exit. The hardware cases return the capability
+skip 77 without a physical adapter.
 
 ## Input script
 
