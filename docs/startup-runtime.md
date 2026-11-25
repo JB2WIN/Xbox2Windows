@@ -1574,7 +1574,8 @@ These are measured on one executable; treat them as hypotheses for others.
   and one line says why (`depth-stencil registers not used (...)`). The decoded state needs a depth
   view: a draw with none bound keeps the desktop default. The stencil reference is list state in
   D3D12, so each draw of such a pipeline with an enabled stencil test calls `OMSetStencilRef` with
-  the decoded value after `SetPipelineState`; it replaces a reference the title recorded before, and
+  the decoded value after `SetPipelineState`; with the switch on, the register state wins over list
+  state: it replaces a reference the title recorded before, and
   whether the console path expects that order is not measured. The pipeline key includes the
   decoded description. With the switch off nothing reads the words: no description, key or
   reference changes, and no log line appears. That is checked device-free

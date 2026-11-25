@@ -397,14 +397,14 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     // desktop state that was found first. A block the decoder refuses leaves the desktop default (depth and stencil off).
     if (info && info->path == 57 && !bound->has_depth_stencil && x2w_local::env_on("X2W_DEPTH_STATE")) {
         const auto chosen = x2w_pipeline_state::select_depth_stencil(true, info->state_a.data(), info->state_a.size());
-        static LONG logged;
+        static LONG logged_applied, logged_refused;
         if (chosen.applied) {
             bound->depth_stencil = chosen.desc;
             bound->has_depth_stencil = bound->depth_from_registers = true;
             bound->has_stencil_ref = chosen.has_stencil_ref;
             bound->stencil_ref = chosen.stencil_ref;
         }
-        if (first_calls(logged, 24)) {
+        if (first_calls(chosen.applied ? logged_applied : logged_refused, 24)) {
             if (chosen.applied)
                 log("x2w-draw pipeline %p: depth-stencil from state block A: depth %d func %d write %d, stencil %d reference 0x%x%s%s",
                     static_cast<void*>(pipeline), chosen.desc.DepthEnable, chosen.desc.DepthFunc, chosen.desc.DepthWriteMask,
@@ -487,9 +487,15 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
     return entry;
 }
 
+// The depth format a translated draw uses: the pass's own view, else the one the pipeline was created with.
+inline DXGI_FORMAT pass_dsv_format(const BoundPipeline& bound, const Pass& pass)
+{
+    return pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+}
+
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
-    const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
+    const DXGI_FORMAT dsv_format = pass_dsv_format(bound, pass);
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
@@ -1188,7 +1194,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     list->SetPipelineState(pipeline);
     // X2W_DEPTH_STATE: the reference of the decoded stencil test is list state in D3D12. It replaces the one a
     // preceding OMSetStencilRef set, for draws of this pipeline only when a depth view is bound.
-    if (bound->depth_from_registers && bound->has_stencil_ref && (pass.dsv_format != DXGI_FORMAT_UNKNOWN || bound->dsv_format != DXGI_FORMAT_UNKNOWN))
+    if (bound->depth_from_registers && bound->has_stencil_ref && pass_dsv_format(*bound, pass) != DXGI_FORMAT_UNKNOWN)
         list->OMSetStencilRef(bound->stencil_ref);
     list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
