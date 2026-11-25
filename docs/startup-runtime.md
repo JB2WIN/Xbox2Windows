@@ -1338,6 +1338,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1412,6 +1413,28 @@ unordered-access flag, and live in a default heap without heap flags:
   `written_textures` entries whose generation has not changed are cleared so
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
+
+`X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
+`X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every
+resource whose final guest Release happened and whose desktop object is still
+alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
+bytes from the budget ticket, `oldest` in frames since the final Release:
+- `view-refs`: a tracked slot 18 descriptor still names it;
+  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `list-hold`, `flight`: a closed or recording list, or a submission, holds a
+  desktop reference.
+- `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
+  `drain-pending`: ready, the drain has not run yet; `unqueued`: no queue could take its marker.
+- `left-class:<view|view-copy|residency|present|hold-missed>`: it was in the class and the first use named left it.
+- `never-class:<buffer|dimension|msaa|rt-ds-uav|heap-type|heap-flags|title-memory|aliased|reserved|slot>`: it was
+  never in the class (`slot`: created by a path that does not classify).
+- `other`: none of the above.
+`total` is the sum; `unattributed` is the budget's retained count and bytes minus
+`total` (backing heaps, upload and readback objects, and anything created outside the wrappers).
+Wrappers without a desktop object (tiled address textures) are not counted. A
+released resource that only a list or submission keeps alive after its wrapper
+let go is matched by its desktop pointer. Without the switches nothing is
+recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
