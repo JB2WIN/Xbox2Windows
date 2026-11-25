@@ -17,3 +17,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/gfx2hlsl-sample-b (image_sample_b, #1996 D) | PC-Joshua | 2026-11-24 23:18 | claimed in #1996 |
 | startup/gfx2hlsl-sopk-addk-mulk (s_addk_i32, s_mulk_i32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-25 00:08 | claimed in #1723 |
 | startup/gfx2hlsl-sopk-signext (SOPK i32 immediate sign extension bug) | PC-Joshua | 2026-11-25 00:23 | bug found while reviewing addk |
+| startup/depth-stencil-apply (#1999 A apply + WARP fixture on #2124) | PC-Joshua | 2026-11-25 02:14 | building |
