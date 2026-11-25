@@ -4791,7 +4791,14 @@ void retire_null_ready_views()
     };
     std::vector<Cleared> cleared;
     std::size_t stuck = 0;
-    if (!TryAcquireSRWLockExclusive(&note_lock)) return;
+    // draw_lock first, in the order draw_translated takes them: a draw holds it from reading a view record until it
+    // retire_holds the texture, so clearing the records under it means a draw either recorded its hold already or
+    // resolves the token to nothing.
+    if (!TryAcquireSRWLockExclusive(&draw_lock)) return;
+    if (!TryAcquireSRWLockExclusive(&note_lock)) {
+        ReleaseSRWLockExclusive(&draw_lock);
+        return;
+    }
     try {
         std::unordered_set<std::uint32_t> ids;  // view ids that name a ready resource
         for (std::uint32_t id = 0; id < view_records().size(); ++id) {
@@ -4827,6 +4834,7 @@ void retire_null_ready_views()
     } catch (const std::bad_alloc&) {
     }
     ReleaseSRWLockExclusive(&note_lock);
+    ReleaseSRWLockExclusive(&draw_lock);
     for (const Cleared& slot : cleared) {
         const u64 token = slot.title_cpu + u64{slot.index} * title_descriptor_stride(slot.title_cpu, slot.increment);
         if (!title_backed(token, 32) || !x2w_local::writable(reinterpret_cast<void*>(token), 32)) continue;
