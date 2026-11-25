@@ -1338,6 +1338,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
@@ -1413,6 +1414,25 @@ unordered-access flag, and live in a default heap without heap flags:
   `written_textures` entries whose generation has not changed are cleared so
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
+
+`X2W_D3D12_RELEASE_RETIRED_VIEWS=1` (only with `X2W_D3D12_RELEASE_RETIRED=1`) ends the
+`view-refs` retention. Once a released class texture's release-time fences have passed,
+the drain (a try-lock, never blocking) replaces every tracked slot-18 descriptor slot
+that names it, in every heap and so every `CopyDescriptors*` copy, by a null SRV of the
+same dimension: the shadow entry and its ref are dropped, the desktop descriptor is
+rewritten with `CreateShaderResourceView(nullptr, ...)`, the view records naming the
+resource lose it, and the view token in title descriptor memory is cleared when it
+still carries that id. A draw that reads the slot afterwards binds a null texture
+(zeros). The texture is then freed by the normal rules: lists and submissions that hold
+it through `retire_hold` keep the desktop object until the recording is dropped or the
+submission's fence passes. No recorded list or submission reads a title heap's SRV
+descriptor (translated draws build their own descriptors from the tokens at draw time
+and hold what they sample), so the rewrite cannot reach GPU work. A slot that cannot be
+rewritten keeps its ref and the texture stays retained. Not covered: a title thread
+that writes the same slot at the moment of the drain, and a guest that uses the
+resource after its final release (unsupported with the switch, as before).
+`startup_resource_retire_views_*` reads the desktop descriptors back through a compute
+probe; the `keep` and `noretire` cases are the negative controls.
 
 `X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
 `X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every

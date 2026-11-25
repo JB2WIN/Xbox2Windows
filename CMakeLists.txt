@@ -1382,6 +1382,28 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_RESOURCE_INDEX_CHECK=1;X2W_D3D12_DEBUG=0")
 endforeach()
 
+# X2W_D3D12_RELEASE_RETIRED_VIEWS=1 frees a released class texture that only tracked slot-18 descriptor slots keep alive by
+# replacing those slots with null descriptors. `keep` is the negative control (views switch off, or retire switch off).
+add_executable(startup_resource_retire_views tests/startup_resource_retire_views.cpp)
+target_include_directories(startup_resource_retire_views PRIVATE src)
+target_compile_features(startup_resource_retire_views PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire_views PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    foreach(debug IN ITEMS 0 1)
+        set(retire_views_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        add_test(NAME startup_resource_retire_views_${backend}_debug${debug} COMMAND startup_resource_retire_views ${backend})
+        set_tests_properties(startup_resource_retire_views_${backend}_debug${debug} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${retire_views_env};X2W_D3D12_RELEASE_RETIRED=1;X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
+    endforeach()
+    set(retire_views_keep "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+    add_test(NAME startup_resource_retire_views_keep_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_keep_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED=1")
+    add_test(NAME startup_resource_retire_views_noretire_${backend} COMMAND startup_resource_retire_views ${backend} keep)
+    set_tests_properties(startup_resource_retire_views_noretire_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "${retire_views_keep};X2W_D3D12_RELEASE_RETIRED_VIEWS=1")
+endforeach()
+
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
 add_executable(startup_compute_binding_trace tests/startup_compute_binding_trace.cpp)
 target_compile_features(startup_compute_binding_trace PRIVATE cxx_std_20)
