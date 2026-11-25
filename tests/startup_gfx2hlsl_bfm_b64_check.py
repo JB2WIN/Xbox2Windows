@@ -364,6 +364,9 @@ class TrackedStage(G.Stage):
         self.used_s, self.used_v = set(), set()
         self.uniform_v, self.varying_s, self.scc_uniform = set(), set(), True
         self.has_branches, self.exec_known = False, True
+        self.past_entry = False
+        self.uniform_expr = {}
+        self.defined_uniform_s, self.bad_sgprs = {4, 5}, set()
         self.exports, self.attrs = {}, {}
         self.pipe = Pipeline()
 
@@ -577,8 +580,11 @@ def check_draw(dxc, renderer, adapter, fxc=None):
     check('draw: the entry constants sit at ud0 (rect) and ud1, ud2 (width, offset)',
           pipe.uds[:3] == [('rect',), ('rootconst', 0, 0), ('rootconst', 0, 1)], repr(pipe.uds))
     vs_text, ps_text = pipe.hlsl_vs(), pipe.hlsl_ps()
+    mask_lines = [line for line in ps_text.splitlines()
+                  if 'uint bw = ' in line and 'uint2 t = shl64(' in line]
     check('draw: the pixel stage computes both pairs from run-time constants',
-          ps_text.count('= shl64(') == 2 and 'ud1' in ps_text and 'ud2' in ps_text)
+          len(mask_lines) == 2 and 'bw = ud1 & 63u' in mask_lines[0] and ', ud2);' in mask_lines[0]
+          and 'bw = ud2 & 63u' in mask_lines[1] and ', ud1);' in mask_lines[1])
     mutated_text = ps_text.replace('bw >= 32u ?', 'bw >= 32u || bw == 0u ?')
     check('draw: the mutated pixel stage differs from the translation', mutated_text != ps_text)
     compilers = ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else []) + [('dxc', dxc, 'vs_6_0', 'ps_6_0')]
