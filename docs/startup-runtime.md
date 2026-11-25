@@ -840,6 +840,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
+| `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
@@ -1552,7 +1553,8 @@ These are measured on one executable; treat them as hypotheses for others.
   reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
   in its colour form, is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
-- Depth-stencil registers are decoded but not applied yet (#1999, item A). State block A of a
+- Depth-stencil registers are decoded, and applied only with `X2W_DEPTH_STATE=1` (#1999, item A;
+  see the next bullet). State block A of a
   slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
   `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
   covered. `src/startup_stubs/pipeline_state_decode.h`
@@ -1564,6 +1566,35 @@ These are measured on one executable; treat them as hypotheses for others.
   each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
   Its `_offset_control` run (words one word later) is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
+- `X2W_DEPTH_STATE=1` (off by default) takes that decoded state for translated draws of slot 57
+  pipelines (`src/startup_stubs/depth_state_apply.h`, applied in `translation_for` in
+  `d3d12_draw.inl`). A slot 57 pipeline has no desktop `DEPTH_STENCIL` subobject, so there is no
+  desktop state to outrank; a state found first is kept regardless. When the decoder refuses the
+  words, or the block is too short, the pipeline keeps the desktop default (depth and stencil off)
+  and one line says why (`depth-stencil registers not used (...)`). The decoded state needs a depth
+  view: a draw with none bound keeps the desktop default. The stencil reference is list state in
+  D3D12, so each draw of such a pipeline with an enabled stencil test calls `OMSetStencilRef` with
+  the decoded value after `SetPipelineState`; it replaces a reference the title recorded before, and
+  whether the console path expects that order is not measured. The pipeline key includes the
+  decoded description. With the switch off nothing reads the words: no description, key or
+  reference changes, and no log line appears. That is checked device-free
+  (`startup_depth_state`, with `startup_depth_state_switch_control` as the negative control) and by
+  the draw fixture's switch-off run, and the existing `startup_stream_depth_*` and
+  `startup_slot57_blend_draw_*` tests, which run without the switch, still pass.
+  `tests/startup_slot57_depth.cpp` and `tests/startup_slot57_depth_check.py` draw two overlapping
+  triangles of unequal depth (z 0.25 and 0.75, same synthetic shaders and vertex program) into an
+  8x4 target with a D24S8 view, with the same renderer on WARP and on a hardware adapter. With
+  reversed-Z words (GREATER, depth cleared to 0) the nearer triangle wins (red); with the switch off
+  the last-drawn triangle wins (green); with LESS, the wrong direction for that clear, nothing
+  passes (blue); a forward-Z LESS case reverses the draw order and shows green with the switch on,
+  red with it off. Stencil is checked separately: EQUAL against a stored 0x5A passes with reference
+  0x5A and fails with 0x5B (the list's own reference is 0, so only the decoded one explains it), and
+  REPLACE 7 followed by EQUAL 7 or EQUAL 8 leaves green or red. Words with a colour-write tie or a
+  stencil `ONES` op fall back to the desktop result. Measured on WARP (10.0.26100.9818) and an
+  NVIDIA GeForce RTX 3080 (driver 32.0.16.2124), Windows 11 10.0.26200
+  (`ctest --preset dev --no-tests=error -R "^startup_(depth_state|slot57_depth)" -V`). Not covered:
+  raster bias, depth bounds, back-face-only state, the title's own `OMSetStencilRef` order, clears
+  (#1806), and any pipeline layout other than the measured one.
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
