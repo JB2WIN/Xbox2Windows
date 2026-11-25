@@ -16,6 +16,10 @@ evaluator that rejects any 32-bit shift count of 32 or more (undefined in HLSL),
 from a bit loop over the ISA description, not from the lowering's expressions. Mutations (no width mask, 31 instead of
 63, offset masked to five bits, width 0 reading all ones) must read a wrong word and are applied to the translated
 text only.
+
+A source SGPR that holds a lane mask (a compare result) is refused before either destination word or its mask flag changes,
+with and without the destination aliasing the source. After #1931 both written words are proven uniform only when both sources
+are, and an older proof for s[d] or s[d+1] is dropped, so a later v_readfirstlane_b32 cannot use it.
 """
 import os
 import re
@@ -337,6 +341,93 @@ for name, (lines, common) in mutations.items():
     changed = lines != base.lines or common != COMMON
     wrong = mutated_wrong(lines, common) if changed else []
     check('mutation "%s" changes the text and reads a wrong word %s' % (name, wrong[:1]), changed and bool(wrong))
+
+# ---- 8. lane-mask sources are refused before any destination state changes (maintainer review of #2007) -----------
+class TrackedStage(G.Stage):
+    """A stage with the #1931 uniformity state, driven instruction by instruction."""
+
+    def __init__(self):
+        self.lines, self.sym, self.masks = [], {}, set()
+        self.used_s, self.used_v = set(), set()
+        self.uniform_v, self.varying_s, self.scc_uniform = set(), set(), True
+        self.has_branches, self.exec_known = False, True
+        self.exports, self.attrs = {}, {}
+        self.pipe = Pipeline()
+
+    def run(self, *instructions):
+        for asm in instructions:
+            self.one(asm.split()[0], asm)
+        return self
+
+
+def snapshot(stage):
+    return (list(stage.lines), dict(stage.sym), set(stage.masks), set(stage.varying_s), set(stage.used_s))
+
+
+CMP = 'v_cmp_lt_f32_e64 %s, v0, v1'
+for label, cmp_dst, bfm in (
+        ('compare mask as width', 's2', 's_bfm_b64 s[20:21], s2, s3'),
+        ('compare mask as offset', 's3', 's_bfm_b64 s[20:21], s2, s3'),
+        ('compare mask as width, destination aliases it', 's20', 's_bfm_b64 s[20:21], s20, s3'),
+        ('compare mask as offset, destination aliases it', 's21', 's_bfm_b64 s[20:21], s2, s21'),
+        ('compare mask as both, destination aliases it', 's20', 's_bfm_b64 s[20:21], s20, s20')):
+    stage = TrackedStage().run(CMP % cmp_dst)
+    reg = int(cmp_dst[1:])
+    before = snapshot(stage)
+    try:
+        stage.run(bfm)
+        refusal = None
+    except G.Unsupported as error:
+        refusal = str(error)
+    check('%s is refused' % label, refusal is not None and 'lane mask' in refusal, repr(refusal))
+    check('%s: no HLSL, no state change' % label, snapshot(stage) == before and reg in stage.masks,
+          repr((before, snapshot(stage))))
+# Controls: the same shapes with a non-mask scalar are accepted, and the compare destination alone stays a mask.
+for asm in ('s_bfm_b64 s[20:21], s2, s3', 's_bfm_b64 s[20:21], s20, s3', 's_bfm_b64 s[20:21], s2, s21'):
+    stage = TrackedStage().run(asm)
+    check('control: %s accepted without a mask source' % asm, 'shl64(' in ' '.join(stage.lines))
+# A mask destination (not a source) loses its flag: the pair is a number afterwards.
+stage = TrackedStage().run(CMP % 's20', 's_bfm_b64 s[20:21], s2, s3')
+check('a mask destination that is not a source loses its flag', 20 not in stage.masks and 21 not in stage.masks)
+
+# ---- 9. both written words carry a fresh uniformity proof (#1931) ----------------------------------------------------
+READ = 'v_readfirstlane_b32 s9, v7'
+REFUSAL = 'v_readfirstlane_b32 requires a proven uniform source'
+
+
+def read_word(stage, word):
+    """Copy s<word> into v7 and read it back: accepted only when the word is proven uniform."""
+    try:
+        stage.run('v_mov_b32_e32 v7, s%d' % word, READ)
+    except G.Unsupported as error:
+        return str(error)
+    return 'accepted'
+
+
+# `s_mov_b64 s[2:3], exec` leaves s2 a lane mask and s3 a varying number, a non-mask varying source.
+VARYING = 's_mov_b64 s[2:3], exec'
+PROVE = 's_bfm_b64 s[20:21], s4, s5'
+stage = TrackedStage().run(PROVE)
+check('uniform sources: both words are proven uniform', read_word(stage, 20) == 'accepted' and
+      read_word(TrackedStage().run(PROVE), 21) == 'accepted')
+for label, bfm in (('width', 's_bfm_b64 s[20:21], s3, s5'), ('offset', 's_bfm_b64 s[20:21], s4, s3'),
+                   ('width and offset', 's_bfm_b64 s[20:21], s3, s3')):
+    for word in (20, 21):
+        # control: the old proof exists, otherwise a refusal below would prove nothing
+        check('old proof for s%d exists before the %s overwrite' % (word, label),
+              read_word(TrackedStage().run(VARYING, PROVE), word) == 'accepted')
+        got = read_word(TrackedStage().run(VARYING, PROVE, bfm), word)
+        check('varying %s: the old proof for s%d is not used' % (label, word), got == REFUSAL, got)
+# Destination aliasing a varying source: s21 is the varying high word of a saved exec.
+for word in (20, 21):
+    got = read_word(TrackedStage().run('s_mov_b64 s[20:21], exec', 's_bfm_b64 s[20:21], s21, s5'), word)
+    check('aliased varying source: s%d is not proven uniform' % word, got == REFUSAL, got)
+# A later uniform write brings the proof back, so the refusals above come from the writes.
+for word in (20, 21):
+    got = read_word(TrackedStage().run(VARYING, 's_bfm_b64 s[20:21], s3, s5', PROVE), word)
+    check('control: a later uniform write re-proves s%d' % word, got == 'accepted', got)
+    stage = TrackedStage().run(VARYING, 's_bfm_b64 s[20:21], s3, s5', 's_bfm_b64 s[20:21], 5, 3')
+    check('control: constant sources re-prove s%d' % word, read_word(stage, word) == 'accepted')
 
 if failures:
     print('FAIL')
