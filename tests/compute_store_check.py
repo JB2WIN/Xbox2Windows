@@ -366,6 +366,7 @@ def controls():
     f32_controls()
     scalar_alu_controls()
     salu_i32_controls()
+    mac_f32_controls()
     dot_u_controls()
     add_co_controls()
     sub_co_controls()
@@ -1256,7 +1257,7 @@ def f32_controls():
         # Fused multiply-add has no binary32 form in DXIL, so both stay refused, as do the other binary32 forms.
         (unsupported + "v_fmac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_fmac_f32_e32 v6, v2, v5"),)),
         (unsupported + "v_fma_f32", (("v_mul_f32_e32 v6, v2, v6", "v_fma_f32 v6, v2, v6, v5"),)),
-        (unsupported + "v_mac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mac_f32_e32 v6, v2, v5"),)),
+        (unsupported + "v_mad_f32", (("v_mul_f32_e32 v6, v2, v6", "v_mad_f32 v6, v2, v6, v5"),)),
         (unsupported + "v_max_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_max_f32_e32 v6, v2, v6"),)),
         (unsupported + "v_mul_legacy_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mul_legacy_f32_e32 v6, v2, v6"),)),
         # The VOP3 spelling, output and input modifiers, an SGPR as the second source and a register range.
@@ -1394,11 +1395,13 @@ def readlane_binary(directory, assembler, objcopy, library):
 
 
 def readlane_draw(directory, compiler, renderer, backend):
+    accepted = set()
     for threads in (32, 64):
         lines = READLANE if threads == 64 else variant(
             READLANE, ("v_lshl_add_u32 v0, s2, 6, v0", "v_lshl_add_u32 v0, s2, 5, v0"))
         binding = READLANE_BINDING if threads == 64 else READ_BINDING
         source = aot.lower(lines, threads, **binding)
+        accepted.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
         src, cso, case = [directory / f"readlane-{threads}.{suffix}" for suffix in ("hlsl", "cso", "case")]
         src.write_text(source, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
@@ -1423,6 +1426,10 @@ def readlane_draw(directory, compiler, renderer, backend):
                 bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
                 if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
                     raise AssertionError(f"readlane: mutation '{label}' escaped detection\n{bad.stderr}")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
     return 0
 
 
@@ -2063,6 +2070,11 @@ def ff1_scalar_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"ff1_scalar: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in FF1_SCALAR if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -3208,6 +3220,151 @@ def dot_u_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         opcodes = sorted({line.split()[0] for line in DOT_U if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
+MAC_F32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s16, 0x40400000",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, 0x40000001, v3",
+    "v_mov_b32_e32 v5, 0x45800800",
+    "v_mov_b32_e32 v10, 0xcb801000",
+    "v_mac_f32_e32 v10, 0x45800800, v5",
+    "v_mov_b32_e32 v11, 0xbf800002",
+    "v_mac_f32_e64 v11, v4, 0x3f800001",
+    "v_mov_b32_e32 v12, 0xc0400000",
+    "v_mac_f32_e32 v12, s16, v4",
+    "v_mov_b32_e32 v13, 0x3f400000",
+    "v_mac_f32_e64 v13, -2.0, 0x3fc00000",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+MAC_F32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def _py_mac_f32(a_bits, b_bits, c_bits, *, fused=False, sub_acc=False):
+    from fractions import Fraction
+    to_f = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]
+    to_u = lambda f: struct.unpack("<I", struct.pack("<f", f))[0]
+    a, b, c = to_f(a_bits), to_f(b_bits), to_f(c_bits)
+    if fused:
+        acc = Fraction(c)
+        return to_u(float(Fraction(a) * Fraction(b) - acc if sub_acc else Fraction(a) * Fraction(b) + acc))
+    prod = to_f(to_u(a * b))
+    return to_u(prod - c if sub_acc else prod + c)
+
+
+def mac_f32_words(*, fused=False, sub_acc=False, zero_d3=False):
+    """Independent Python model for MAC_F32."""
+    words = [SENTINEL] * 320
+    w0 = _py_mac_f32(0x45800800, 0x45800800, 0xcb801000, fused=fused)
+    w3 = _py_mac_f32(0xc0000000, 0x3fc00000, 0 if zero_d3 else 0x3f400000, fused=fused)
+    for flat in range(64):
+        v4 = 0x40000001 + flat
+        w1 = _py_mac_f32(v4, 0x3f800001, 0xbf800002, fused=fused)
+        w2 = _py_mac_f32(0x40400000, v4, 0xc0400000, fused=fused, sub_acc=sub_acc)
+        words[4 * flat:4 * flat + 4] = [w0, w1, w2, w3]
+    return words
+
+
+def mac_f32_controls():
+    """Exact HLSL and refusals for v_mac_f32_e32 and v_mac_f32_e64."""
+    hlsl = aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+    assert "uint f32_mac(uint a, uint b, uint c)" in hlsl
+    expected_store = (
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "f32_mac(0x45800800u, 0x45800800u, 0xcb801000u), "
+        "f32_mac((0x40000001u + tid.x), 0x3f800001u, 0xbf800002u), "
+        "f32_mac(0x40400000u, (0x40000001u + tid.x), 0xc0400000u), "
+        "f32_mac(0xc0000000u, 0x3fc00000u, 0x3f400000u)));"
+    )
+    assert hlsl.splitlines()[-2] == expected_store, hlsl.splitlines()[-5:]
+    # f32 profile literal refusals: NaN, Inf, denormal constants.
+    for bad_const in ("0x7fc00000", "0x7f800000", "0x00000001"):
+        rejects("Unverified float operand", aot.lower,
+                variant(MAC_F32, ("0x3fc00000", bad_const)), 64, **MAC_F32_BINDING)
+    # Unknown/pending sources, uninitialized accumulator D, and invalid destination.
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("v4, 0x3f800001", "v40, 0x3f800001")), 64, **MAC_F32_BINDING)
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("s16, v4", "s12, v4")), 64, **MAC_F32_BINDING)
+    rejects("Unverified float operand", aot.lower,
+            variant(MAC_F32, ("v_mov_b32_e32 v13, 0x3f400000", "v_mov_b32_e32 v14, 0x3f400000")),
+            64, **MAC_F32_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(MAC_F32, ("v13, -2.0", "v256, -2.0")), 64, **MAC_F32_BINDING)
+    # Modifiers, e32 SGPR src1, and bare spelling are refused.
+    for bad_line in (
+            "v_mac_f32_e32 v10, -0x45800800, v5",
+            "v_mac_f32_e64 v13, |-2.0|, 0x3fc00000",
+            "v_mac_f32_e64 v13, -2.0, 0x3fc00000 clamp",
+            "v_mac_f32_e64 v13, -2.0, 0x3fc00000 mul:2",
+            "v_mac_f32_e32 v10, v5, s16",
+            "v_mac_f32 v10, 0x45800800, v5"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(MAC_F32, ("v_mac_f32_e32 v10, 0x45800800, v5", bad_line)),
+                64, **MAC_F32_BINDING)
+
+
+def mac_f32_binary(directory, assembler, objcopy, library):
+    """The assembled MAC_F32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, MAC_F32), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_mac_f32")] == [
+        line for line in MAC_F32 if line.startswith("v_mac_f32")], decoded
+    assert aot.lower(decoded, 64, **MAC_F32_BINDING) == aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+
+
+def mac_f32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("mac_f32.hlsl", "mac_f32.cso", "mac_f32.case")]
+    source = aot.lower(MAC_F32, 64, **MAC_F32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = mac_f32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("fused FMA instead of unfused MAC", mac_f32_words(fused=True), 0),
+            ("product minus accumulator", mac_f32_words(sub_acc=True), 2),
+            ("accumulator zeroed", mac_f32_words(zero_d3=True), 3),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"mac_f32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    mutations = [
+        ("p - asfloat(c) instead of p + asfloat(c)", source.replace("p + asfloat(c)", "p - asfloat(c)")),
+        ("accumulator dropped", source.replace("p + asfloat(c)", "p")),
+    ]
+    if backend == "hardware":
+        mutations.append((
+            "fused mad() instead of unfused multiply+add",
+            source.replace("precise float p = asfloat(a) * asfloat(b); precise float r = p + asfloat(c);",
+                           "precise float r = mad(asfloat(a), asfloat(b), asfloat(c));"),
+        ))
+    for label, mutated in mutations:
+        if mutated == source:
+            raise AssertionError(f"mac_f32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"mac_f32: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in MAC_F32 if line.strip()})
         path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
@@ -5398,6 +5555,7 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     salu_i32_binary(directory, assembler, objcopy, library)
+    mac_f32_binary(directory, assembler, objcopy, library)
     dot_u_binary(directory, assembler, objcopy, library)
     add_co_binary(directory, assembler, objcopy, library)
     sub_co_binary(directory, assembler, objcopy, library)
@@ -6235,6 +6393,7 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend, *, xyz=False
     compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
     run = [renderer, backend, "--compute-store-case", cso, case]
     accepted = []
+    opcodes = set()
     cases = (mubuf_format_store_cases(xyz=True) if xyz else
              (*mubuf_format_store_cases(), *mubuf_format_store_cases(packed=True)))
     for name, lines, binding in cases:
@@ -6288,11 +6447,13 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend, *, xyz=False
             raise AssertionError(f"{name}: incorrect store escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(name)
+        opcodes.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
     # Register the candidate after its native reference has been verified.
-    if not xyz and (record := os.environ.get("FORM_COVERAGE_RECORD")):
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+        lines_to_write = sorted(opcodes) if xyz else accepted
+        path.write_text("\n".join(lines_to_write) + "\n", encoding="utf-8")
     return 0
 
 
@@ -7807,6 +7968,11 @@ def draw_dpp(directory, compiler, renderer, backend):
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError(f"DPP no-shuffle negative control escaped detection\n{bad.stderr}")
     print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in DPP_QUAD_PERM if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -8053,9 +8219,11 @@ def draw_scratch_base_write(directory, compiler, renderer, backend):
     return draw(directory, compiler, renderer, backend, cases=SCRATCH_BASE_WRITE_CASES)
 
 def draw(directory, compiler, renderer, backend, cases=None):
+    accepted = set()
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
+        accepted.update(line.split()[0] for line in lines if line.strip() and not line.strip().endswith(":"))
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
         if name == "read_mul_lo":
@@ -8118,6 +8286,10 @@ def draw(directory, compiler, renderer, backend, cases=None):
         bad = subprocess.run(cmd, capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError("A wrong stored word escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
     return 0
 
 
@@ -8146,7 +8318,7 @@ DESCRIPTOR_STORES = (
     ("buffer_store_format_x", 56, 20, False, (("xor", UINT_PAYLOAD),)),
     ("buffer_store_format_d16_xy", 60, 23, False, (PACKED_25_75,)),
     ("buffer_store_format_d16_xyz", 68, 74, False, (PACKED_25_75, H25)),
-    ("buffer_store_format_xyzw", 80, 44, False, (F25, F75, 0, F75)),
+    ("buffer_store_format_xyzw", 80, 50, False, (F25, F75, 0, F75)),
     ("buffer_store_format_x", 96, 7, False, (F25,)),
     ("buffer_store_format_x", 100, 11, False, (UINT16_BITS,)),
     ("buffer_store_format_x", 104, 8, False, (F75,)),
@@ -8345,10 +8517,19 @@ def find_llvm15():
         for name in ("LLVM-C.dll", "libLLVM-15.so.1", "libLLVM.so"):
             if (parent / name).exists():
                 return ("mc", mc, objcopy, str(parent / name))
-    windows = Path(r"C:\Program Files\LLVM\bin")
-    clang, objcopy_path, library = windows / "clang.exe", windows / "llvm-objcopy.exe", windows / "LLVM-C.dll"
-    if clang.exists() and objcopy_path.exists() and library.exists():
-        return ("clang", str(clang), str(objcopy_path), str(library))
+    if os.name == "nt":
+        # The Windows LLVM 15 package ships clang's integrated assembler instead of llvm-mc.
+        for directory in [*os.get_exec_path(), r"C:\Program Files\LLVM\bin"]:
+            windows = Path(directory)
+            clang, objcopy_path, library = (windows / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            if not (windows.is_absolute() and clang.is_file() and objcopy_path.is_file() and library.is_file()):
+                continue
+            try:
+                version = subprocess.run([clang, "--version"], capture_output=True)
+            except OSError:
+                continue
+            if version.returncode == 0 and re.search(rb"\bclang version 15\.", version.stdout):
+                return ("clang", str(clang), str(objcopy_path), str(library))
     return None
 
 
@@ -8371,7 +8552,7 @@ def descriptor_store_round_trip(directory, lines, binding, kind, tool, objcopy, 
 PINNED_LEGACY_WORDS = {
     20: 0x00024FAC, 22: 0x00027FAC, 62: 0x0005CFAC, 64: 0x0005FFAC,
     72: 0x0006CFAC, 74: 0x0006FFAC, 75: 0x00074FAC, 77: 0x00077FAC,
-    56: 0x00050FAC, 23: 0x00028FAC, 44: 0x00040FAC, 29: 0x0002FFAC,
+    56: 0x00050FAC, 23: 0x00028FAC, 50: 0x00048FAC, 29: 0x0002FFAC,
     71: 0x00067FAC, 7: 0x00010FAC, 8: 0x00011FAC, 11: 0x00014FAC,
     12: 0x00015FAC, 13: 0x00017FAC,
 }
@@ -8545,6 +8726,16 @@ def descriptor_shader_bytes(source, thread_id):
 
 
 def descriptor_store_controls():
+    if os.name == "nt":
+        # A complete toolchain on PATH must enable the optional round trip outside Program Files too.
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = tuple(Path(tmp) / name for name in ("clang.exe", "llvm-objcopy.exe", "LLVM-C.dll"))
+            for tool in tools:
+                tool.touch()
+            version = subprocess.CompletedProcess([], 0, b"clang version 15.0.7\n")
+            with (patch.object(shutil, "which", return_value=None), patch.object(os, "get_exec_path", return_value=[tmp]),
+                  patch.object(subprocess, "run", return_value=version)):
+                assert find_llvm15() == ("clang", *map(str, tools))
     assert descriptor_unorm_bits(F25, 255) == 64
     assert descriptor_unorm_bits(F75, 255) == 191
     assert descriptor_unorm_bits(F25, 1023) == 256
@@ -8563,7 +8754,9 @@ def descriptor_store_controls():
         assert aot.descriptor_format_word(code, legacy=True) == word
         assert aot.decode_buffer_descriptor_format(word)[0] == code
     handled = 0x01038FAC
-    for word in (aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
+    # 10_10_10_2_UNORM (44, legacy DFMT 8) puts a 2-bit x in bits 1:0, not the 2_10_10_10 layout unorm10 packs.
+    for word in (aot.DESCRIPTOR_GFX10_FIXED | (44 << 12), 0x00040FAC,
+                 aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
                  handled | (1 << 23), handled | (1 << 21), handled | (1 << 28), handled | (1 << 30),
                  handled & ~0xFFF, 0):
         rejects("Unsupported buffer descriptor format", aot.decode_buffer_descriptor_format, word)
@@ -8653,6 +8846,14 @@ def descriptor_store_draw(directory, compiler, renderer, backend):
     result = subprocess.run(run)
     if result.returncode:
         return result.returncode
+    print("refused 10_10_10_2_UNORM", flush=True)
+    xyzw = next(index for index, store in enumerate(DESCRIPTOR_STORES) if store[1] == 80)
+    case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={xyzw}))
+                     + struct.pack("<16I", *descriptor_constants(
+                         {xyzw: aot.DESCRIPTOR_GFX10_FIXED | (44 << 12)})))
+    result = subprocess.run(run)
+    if result.returncode:
+        return result.returncode
     print("refused d16 16_UINT", flush=True)
     case.write_bytes(struct.pack("<321I", 1, *descriptor_words(1, refuse={2}))
                      + struct.pack("<16I", *descriptor_constants({2: aot.descriptor_format_word(11)})))
@@ -8668,6 +8869,11 @@ def descriptor_store_draw(directory, compiler, renderer, backend):
     if bad.returncode != 1 or "word=14 expected=89abcdef actual=89abcdee" not in bad.stderr:
         raise AssertionError(f"incorrect 32_UINT store escaped detection\n{bad.stderr}")
     print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in lines if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
     return 0
 
 
@@ -8724,6 +8930,7 @@ if __name__ == "__main__":
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-salu_i32": salu_i32_draw,
+                 "draw-mac-f32": mac_f32_draw,
                  "draw-dot-u": dot_u_draw,
                  "draw-add-co": add_co_draw,
                  "draw-sub-co": sub_co_draw,
