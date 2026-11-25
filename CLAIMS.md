@@ -15,3 +15,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/gfx2hlsl-subrev-dpp (v_subrev_f32 DPP in gfx2hlsl, #1996 B) | PC-Joshua | 2026-11-24 23:04 | claimed in #1996 |
 | startup/gfx2hlsl-sopk-addk-mulk (s_addk_i32, s_mulk_i32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-25 00:08 | claimed in #1723 |
 | issue #2177 (sampler LOD limits for image_sample/_l/_lz) | PC-Joshua | 2026-11-25 02:57 | proposal open, after #2051 |
+| startup/sampler-lod-limits (#2177 constant sampler LOD for image_sample/_l/_lz) | PC-Joshua | 2026-11-25 08:23 | building, approved in #2177 |
