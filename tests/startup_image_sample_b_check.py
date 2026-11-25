@@ -20,9 +20,17 @@ the draw rewrites only the u initialiser of the translated HLSL to 0.75 + 0.5 * 
 still samples u = 0.75, but u changes by 0.5 per pixel, a footprint of two texels on the 4x4 base level, an implicit
 LOD of exactly 1. The call under test, SampleBias(..., bias), is not touched. The draw samples the 4x4 two-slice,
 three-mip array of tests/startup_image_3d.cpp (--startup-image-2d-array-mips) with a point sampler whose descriptor
-sets MAX_LOD 2 and mip filter "point" (word 2 bits 27:26 = 1; a filter of 0 would disable mipmapping). Bias -1 then
+sets a mip filter of "point" (word 2 bits 27:26 = 1; a filter of 0 would disable mipmapping). Bias -1 then
 reads mip 0, bias 0 mip 1 and bias +1 mip 2, and a sample without bias reads mip 1. Plain 2D, 3D and NSA forms are
 checked on the generated HLSL only.
+
+Sampler limits. The descriptor's MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) clamp the biased LOD and are
+unsigned 4.8 (Mesa 24.0.0 src/amd/registers/gfx10-rsrc.json, SQ_IMG_SAMP_WORD1; radeonsi si_state.c:5169-5170). The
+translated sampler carries them to MinLOD and MaxLOD (manifest line smpl). The fixtures that discriminate are the ones
+whose limit is BELOW the mip the unclamped LOD reaches while that mip exists: MAX_LOD 1 with bias +1 must stay on mip 1
+(unclamped mip 2 is visible, with its own colour), MIN_LOD 2 with bias -1 must read mip 2 (unclamped mip 0). The
+MAX_LOD 2 cases cannot tell, since mip 2 is the last level. A descriptor LOD bias (word 2 bits 19:0), mip filter 0,
+MIN_LOD above MAX_LOD and every sampler that is not a constant (sampler heap, root constant) are refused.
 """
 import re
 import struct
@@ -35,6 +43,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'tools' / 'startup'))
 sys.path.insert(0, str(HERE))
 import gfx2hlsl as G  # noqa: E402
+import startup_sampler_heap_check as H  # noqa: E402
 from startup_image_2d_array_check import mip_cell  # noqa: E402
 from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, assemble, compile_hlsl, root_blob  # noqa: E402
 
@@ -50,6 +59,19 @@ v_mov_b32 v0, {bias}
 v_mov_b32 v1, 0x3f400000
 v_mov_b32 v2, 0x3e800000
 v_mov_b32 v3, s9
+s_waitcnt lgkmcnt(0)
+{instruction}
+s_waitcnt vmcnt(0)
+exp mrt0 v4, v5, v6, v7 done vm
+s_endpgm
+"""
+# The sampler words come from a run-time load of the sampler heap at the byte offset in root constant 1 (s9).
+HEAP_PROGRAM = """s_load_dwordx8 s[16:23], s[8:9], 0x0
+s_load_dwordx4 s[24:27], s[10:11], s9
+v_mov_b32 v0, 1.0
+v_mov_b32 v1, 0x3f400000
+v_mov_b32 v2, 0x3e800000
+v_mov_b32 v3, 0
 s_waitcnt lgkmcnt(0)
 {instruction}
 s_waitcnt vmcnt(0)
@@ -88,6 +110,16 @@ FIXTURES = {
     'dim1d': ('image_sample_b v[4:7], v[0:1], ' + TAIL + 'SQ_RSRC_IMG_1D', '1.0', SAMPLER),
     'cube': ('image_sample_b v[4:7], v[0:3], ' + TAIL + 'SQ_RSRC_IMG_CUBE', '1.0', SAMPLER),
     'msaa': ('image_sample_b v[4:7], v[0:3], ' + TAIL + 'SQ_RSRC_IMG_2D_MSAA', '1.0', SAMPLER),
+    # The sampler is loaded from the sampler heap at a run-time offset (no constant words): see HEAP_FIXTURES.
+    'sampler heap': (ARRAY, None, None),
+    # The guest LOD limits: MAX_LOD 1.0 (0x100 << 12) and MIN_LOD 2.0 (0x200 in bits 11:0), both with MAX_LOD <= 2.
+    'array max1': (ARRAY, '1.0', ('0', '0x100000', '0x4000000')),
+    'array max0': (ARRAY, '1.0', ('0', '0', '0x4000000')),
+    'array min2': (ARRAY, '-1.0', ('0', '0x200200', '0x4000000')),
+    'array min1 max1': (ARRAY, '-1.0', ('0', '0x100100', '0x4000000')),
+    'array min3 max2': (ARRAY, '-1.0', ('0', '0x200300', '0x4000000')),
+    'mip filter none': (ARRAY, '1.0', ('0', '0x200000', '0')),
+    'sampler from root constant': (ARRAY, '1.0', ('s9', '0x200000', '0x4000000')),
     # A descriptor LOD bias (word 2 bits 13:0) or secondary LOD bias (bits 19:14) is not carried to the static sampler.
     'sampler bias': (ARRAY, '1.0', ('0', '0x200000', '0x4000001')),
     'sampler bias sec': (ARRAY, '1.0', ('0', '0x200000', '0x4004000')),
@@ -238,12 +270,55 @@ WORDS = {
         'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
         '0004c400703f8cbf0f1800f804050607000081bf'
     ),
+    'sampler heap': (
+        '04040cf4000000fa050608f400000012f202007eff02027e0000403fff02047e'
+        '0000803e8002067e7fc08cbf280f94f00004c400703f8cbf0f1800f804050607'
+        '000081bf'
+    ),
+    'array max1': (
+        '04040cf4000000fa800398beff0399be00001000ff039abe0000000480039bbe'
+        'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
+        '0004c400703f8cbf0f1800f804050607000081bf'
+    ),
+    'array max0': (
+        '04040cf4000000fa800398be800399beff039abe0000000480039bbef202007e'
+        'ff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f00004c400'
+        '703f8cbf0f1800f804050607000081bf'
+    ),
+    'array min2': (
+        '04040cf4000000fa800398beff0399be00022000ff039abe0000000480039bbe'
+        'f302007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
+        '0004c400703f8cbf0f1800f804050607000081bf'
+    ),
+    'array min1 max1': (
+        '04040cf4000000fa800398beff0399be00011000ff039abe0000000480039bbe'
+        'f302007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
+        '0004c400703f8cbf0f1800f804050607000081bf'
+    ),
+    'array min3 max2': (
+        '04040cf4000000fa800398beff0399be00032000ff039abe0000000480039bbe'
+        'f302007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
+        '0004c400703f8cbf0f1800f804050607000081bf'
+    ),
+    'mip filter none': (
+        '04040cf4000000fa800398beff0399be0000200080039abe80039bbef202007e'
+        'ff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f00004c400'
+        '703f8cbf0f1800f804050607000081bf'
+    ),
+    'sampler from root constant': (
+        '04040cf4000000fa090398beff0399be00002000ff039abe0000000480039bbe'
+        'f202007eff02027e0000403fff02047e0000803e0902067e7fc08cbf280f94f0'
+        '0004c400703f8cbf0f1800f804050607000081bf'
+    ),
 }
 # END WORDS
 
 
 def source(name):
-    instruction, bias, (w0, w1, w2) = FIXTURES[name]
+    instruction, bias, sampler = FIXTURES[name]
+    if sampler is None:
+        return HEAP_PROGRAM.format(instruction=instruction)
+    w0, w1, w2 = sampler
     return PROGRAM.format(instruction=instruction, bias=bias, w0=w0, w1=w1, w2=w2)
 
 
@@ -268,7 +343,9 @@ def locate():
     assert data.count(bytes.fromhex('080f94f0')) == 1
 
 
-def stage(name):
+def stage(name, sampler_heap=None):
+    if FIXTURES.get(name, (0, 0, 0))[2] is None:
+        return G.Pipeline(H.VS_WORDS, words(name), H.root_blob(), sampler_heap=sampler_heap)
     return G.Pipeline(VS_WORDS, words(name), root_blob())
 
 
@@ -295,8 +372,10 @@ def bias_call(ps, kind):
 BASE_LOD = 1  # the implicit LOD of the draw (see the module docstring)
 
 
-def mip_for(bias):
-    return max(0, min(2, BASE_LOD + int(bias)))
+def mip_for(bias, min_lod=0, max_lod=2):
+    """The mip the point-mip sampler reads: the biased LOD, clamped to the descriptor's MIN_LOD and MAX_LOD, and to
+    the last of the three levels."""
+    return max(0, min(2, max(min_lod, min(max_lod, BASE_LOD + int(bias)))))
 
 
 def texel_cell(mip, slice_index):
@@ -359,7 +438,7 @@ def controls():
           'NSA array [v3 | v1 v2 v0], 3D [v0 | v1 v2 v3]')
     ps = stage('array 1').hlsl_ps()
     manifest = stage('array 1').manifest()
-    assert 'srv 0 tex2da table 0 0' in manifest and 'smp 0 0x0 0x200000 0x4000000 0x0' in manifest, manifest
+    assert 'srv 0 tex2da table 0 0' in manifest and 'smpl 0 0x0 0x200000 0x4000000 0x0' in manifest, manifest
     assert 'udsrc 1 rootconst 1 0' in manifest and re.search(r'\bv3 = ud1;', ps), (manifest, ps)
 
     # Negative control: without the bias the same program is a plain implicit sample on another address.
@@ -389,6 +468,34 @@ def controls():
     print('refused: b_cl, c_b, offset, gather4_b, cube, MSAA, 1D, a16, d16, tfe, lwe, unorm, r128, dmask 0, '
           'reserved bits, sampler LOD bias')
 
+    # Guest sampler limits: carried over for a constant descriptor, refused where they cannot be shown irrelevant.
+    for name, line in (('array max1', 'smpl 0 0x0 0x100000 0x4000000 0x0'), ('array max0', 'smpl 0 0x0 0x0 0x4000000 0x0'),
+                       ('array min2', 'smpl 0 0x0 0x200200 0x4000000 0x0'),
+                       ('array min1 max1', 'smpl 0 0x0 0x100100 0x4000000 0x0')):
+        manifest = stage(name).manifest()
+        assert line in manifest.splitlines() and 'smp 0 ' not in manifest, (name, manifest)
+    # Negative control: the same words through an ordinary sample have no smpl line (their limits stay unbounded).
+    other = G.Pipeline(VS_WORDS, bytes.fromhex(WORDS['array nobias']), root_blob())
+    other.hlsl_ps()
+    assert 'smp 0 0x0 0x200000 0x4000000 0x0' in other.manifest().splitlines() and 'smpl' not in other.manifest()
+    refused('array min3 max2', 'image_sample_b with sampler MIN_LOD 0x300 above MAX_LOD 0x200')
+    refused('mip filter none', 'image_sample_b with mipmapping disabled')
+    refused('sampler from root constant', 'image_sample_b with a sampler that is not constant')
+    for heap, text in ((True, 'image_sample_b through a sampler heap (LOD limits and bias unknown)'),
+                       (False, 'image_sample_b through a sampler heap (replaced by a default sampler)')):
+        try:
+            stage('sampler heap', sampler_heap=heap).hlsl_ps()
+        except G.Unsupported as error:
+            assert text == str(error), (heap, str(error))
+        else:
+            raise AssertionError('image_sample_b accepted a heap sampler (table %s)' % heap)
+    # Control: the same heap program with a plain image_sample is still translated, so the refusal is the _b form's.
+    plain_heap = H.PS_WORDS
+    for heap in (True, False):
+        G.Pipeline(H.VS_WORDS, plain_heap, H.root_blob(), sampler_heap=heap).hlsl_ps()
+    print('limits: smpl line for MIN_LOD/MAX_LOD; refused: MIN_LOD > MAX_LOD, mip filter 0, root-constant sampler, '
+          'sampler heap (table and default-sampler shortcut)')
+
     # Cache-policy bits do not change the sampled value; a partial dmask only changes the destination.
     for name in ('glc', 'slc', 'dlc'):
         assert stage(name).hlsl_ps() == stage('plain').hlsl_ps(), name
@@ -404,6 +511,10 @@ def controls():
 
 # (fixture, bias): the mip the bias selects.
 DRAW_CASES = [('array -1', -1), ('array 0', 0), ('array 1', 1)]
+# (fixture, bias, MIN_LOD, MAX_LOD, mip the guest reads, mip an ignored limit would read): the limits clamp the biased
+# LOD below the mip the unclamped LOD reaches. Mip 2, the next level above MAX_LOD 1, is visible in the texture.
+LIMIT_CASES = [('array max1', 1, 0, 1, 1, 2), ('array max0', 1, 0, 0, 0, 2),
+               ('array min2', -1, 2, 2, 2, 0), ('array min1 max1', -1, 1, 1, 1, 0)]
 CALL = 'r0.SampleBias(q0, float3(F(v1), F(v2), F(v3)), F(v0))'
 U_INIT = 'v1 = 0x3f400000u;'
 U_DERIVED = 'v1 = U(0.75 + 0.5 * (i.pos.x - 0.5));'
@@ -452,7 +563,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         return run
 
     def sampler_line(pipe):
-        lines = [line for line in pipe.manifest().splitlines() if line.startswith('smp ')]
+        lines = [line for line in pipe.manifest().splitlines() if line.startswith(('smp ', 'smpl '))]
         assert len(lines) == 1, pipe.manifest()
         return lines[0]
 
@@ -487,6 +598,28 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                                              % (kind, bias, run.stdout, run.stderr))
                 print('%s image_sample without bias, expecting bias %d: fails as expected, reads mip 1' % (kind, bias),
                       flush=True)
+            # The descriptor limits are what the guest read, and mip 2 is visible: a bias that would reach it stays on the
+            # limit. The control reads every case once through the smpl line.
+            for name, bias, lo, hi, mip, unclamped in LIMIT_CASES:
+                pipe = stage(name)
+                assert mip == mip_for(bias, lo, hi) and unclamped == mip_for(bias) and mip != unclamped, name
+                tag = name.replace(' ', '')
+                shader = compile_hlsl(compiler, kind, drawable(pipe.hlsl_ps()), 'ps_limit_%s_%s' % (tag, kind), ps_profile, directory)
+                line = sampler_line(pipe)
+                assert line.startswith('smpl '), line
+                for slice_index in (0, 1):
+                    expected = texel_cell(mip, slice_index)
+                    run = draw_once(vs, shader, slice_index, expected, line)
+                    if run.returncode:
+                        raise AssertionError('%s %s slice=%d\n%s\n%s' % (kind, name, slice_index, run.stdout, run.stderr))
+                    print('%s sample_b %s slice=%d: %s' % (kind, name, slice_index, expected), flush=True)
+                # Mutant: the limits are not carried (the ordinary smp line, MinLOD 0 and MaxLOD unbounded).
+                dropped = 'smp ' + line[len('smpl '):]
+                run = draw_once(vs, shader, 1, texel_cell(mip, 1), dropped)
+                if run.returncode == 0 or 'actual=%s' % texel_cell(unclamped, 1) not in run.stderr:
+                    raise AssertionError('%s %s: dropping the limits still read mip %d\n%s\n%s'
+                                         % (kind, name, mip, run.stdout, run.stderr))
+                print('%s sample_b %s, limits not carried: fails as expected, reads mip %d' % (kind, name, unclamped), flush=True)
             for label, call, name, mip in MUTANTS:
                 bias = dict(DRAW_CASES)[name]
                 assert CALL in translated[name], translated[name]
