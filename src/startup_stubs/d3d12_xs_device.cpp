@@ -153,7 +153,8 @@ struct alignas(16) WrapperOwn {
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
-    bool retire_when_idle;  // Resource: member of the retire class (X2W_D3D12_RELEASE_RETIRED), cleared by any other use.
+    bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
+                            // accesses: a race needs the guest to use a resource across its own final Release.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
     u64 compute_trace_key;   // Opt-in trace: selected slot 62 container hash
@@ -773,8 +774,9 @@ bool release_retired_enabled()
 
 // The retire class of X2W_D3D12_RELEASE_RETIRED, decided once at creation from the desktop description: a committed
 // 2D texture with one sample, no render-target, depth-stencil or unordered-access use, in a default heap with no heap
-// flags, that has no title memory. Every use of such a resource reaches the shim through the handlers that
-// retire_hold covers or that clear the flag; see docs/startup-runtime.md#d3d12-resource-budget.
+// flags, that has no title memory (with the title's __XMemAllocationHooks__ export every slot 127 resource gets title
+// memory, so none is in the class then). Every use reaches the shim through handlers that retire_hold covers or that
+// clear the flag; see docs/startup-runtime.md#d3d12-resource-budget.
 bool retire_class(const D3D12_HEAP_PROPERTIES& props, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC& desc,
                   const void* title_memory)
 {
@@ -3433,6 +3435,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u -> not submitted (noop lists)", count);
         return;
     }
+    // No hold or flight is recorded here: the copy handlers that create holds exist only in render mode.
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     static_cast<ID3D12CommandQueue*>(self->own().real)->ExecuteCommandLists(count, real.data());
@@ -4195,21 +4198,16 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
 
-// X2W_D3D12_RELEASE_RETIRED=1 (opt-in; docs/startup-runtime.md#d3d12-resource-budget). The desktop object of a resource
-// of the retire class (retire_class) is released after its final guest Release, once both hold:
-//   - Release-time fences: every queue the shim created owns a private desktop fence. The final Release signals each of
-//     them, so the recorded values lie behind everything already submitted, and the drain compares them. A release with
-//     no registered queue, or one whose fence failed, retires nothing.
-//   - No use is left: a list that recorded a copy, texture copy or resolve of the resource holds a desktop reference
-//     until the list is Reset, closed with an error or destroyed (an unsubmitted list is discarded without any
-//     submission), and every submission of such a list holds one until its queue passes a fence signalled right behind it.
-// Nothing waits. The drain runs at the start of ExecuteCommandLists and Present and only try-locks retire_lock;
-// desktop references are dropped after the lock is released. A hold, marker or submission fence that cannot be recorded
-// leaves the resource retained for the process, which is the lifetime without the switch. The wrapper itself stays.
+// X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
+// member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
+// owns a private fence that the Release signals) and (2) no list or submission names it: a list holds a desktop
+// reference from a forwarded copy until it is Reset, fails to Close or is destroyed, and each submission holds one until
+// its queue passes a fence signalled behind it. Nothing waits; the drain only try-locks and drops references outside
+// the lock. What cannot be recorded stays retained for the process, the lifetime without the switch.
 constexpr LONG retired_refs = -0x40000000;
 SRWLOCK retire_lock = SRWLOCK_INIT;  // a leaf: taken after draw_lock and allocator_lock, nothing is taken under it
 struct RetireQueue {
-    ID3D12CommandQueue* queue;
+    ID3D12CommandQueue* queue;  // no reference: release() never frees a queue object
     ID3D12Fence* fence;  // null: no marker for this queue, so nothing retires
     UINT64 signaled;
 };
@@ -4257,8 +4255,8 @@ void retire_leave_class(const void* object)
 }
 
 // After a copy, texture copy or resolve was forwarded to the desktop list: the list keeps a desktop reference to the
-// resource until its recording is dropped. Only wrappers can be members of the class, so a raw desktop pointer is
-// never held (and never retired).
+// resource until its recording is dropped. Only wrappers are members of the class, so a raw desktop pointer is never
+// held. Assumption, not proven: the guest has no raw pointer to the desktop object of a class member.
 void retire_hold(Wrapper* list, Wrapper* resource)
 {
     if (!resource || !resource->own().retire_when_idle) return;
@@ -4324,8 +4322,8 @@ void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper
         while (index < retire_queues.size() && retire_queues[index].queue != queue) ++index;
         if (index < retire_queues.size() && retire_queues[index].fence) {
             RetireQueue& q = retire_queues[index];
-            for (ID3D12Resource* resource : named) resource->AddRef();
             if (SUCCEEDED(queue->Signal(q.fence, q.signaled + 1))) {
+                for (ID3D12Resource* resource : named) resource->AddRef();
                 ++q.signaled;
                 retire_flights.push_back({index, q.signaled, std::move(named)});
                 InterlockedIncrement(&retire_pending);
@@ -4444,6 +4442,7 @@ extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, voi
 {
     if (!out) return FALSE;
     *out = {};
+    if (!release_retired_enabled()) return FALSE;  // like x2w_d3d12_budget_snapshot: nothing to report without the switch
     if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind && r->own().real) {
         auto* real = static_cast<ID3D12Resource*>(r->own().real);
         AcquireSRWLockExclusive(&draw_lock);
