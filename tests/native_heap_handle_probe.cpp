@@ -149,6 +149,13 @@ int wmain(int argc, wchar_t **argv) {
         std::printf("adapter lacks shader model 6.6 or resource binding tier 3 (tier %d)\n", int(options.ResourceBindingTier));
         return 77;
     }
+    // The native module declares WaveSize=32 (the guest wave), so an adapter without 32-lane waves cannot create it.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 waves{};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &waves, sizeof waves)) || !waves.WaveOps ||
+        waves.WaveLaneCountMin > 32 || waves.WaveLaneCountMax < 32) {
+        std::printf("adapter has no 32-lane waves (%u..%u)\n", waves.WaveLaneCountMin, waves.WaveLaneCountMax);
+        return 77;
+    }
     try {
         x2w::ShaderDxilCompiler compiler(argv[2]);
         const auto module = native_module(shader_flags);
