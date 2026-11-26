@@ -100,6 +100,7 @@ std::string native_module(unsigned shader_flags) {
              {{"%dx.types.Handle", output}, {"i32", address}, {"i32", "undef"}, {"i32", value}, {"i32", "undef"},
               {"i32", "undef"}, {"i32", "undef"}, {"i8", "1"}, {"i32", "4"}},
              "nounwind");
+    m.body << "  ret void\n";
     return m.finish_compute(words, 1, 1);
 }
 
