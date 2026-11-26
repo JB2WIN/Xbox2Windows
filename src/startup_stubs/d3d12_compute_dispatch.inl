@@ -27,7 +27,7 @@ struct ComputeTranslation {
     };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
-    ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
+    x2w_startup::ManifestRetry manifest_retry;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
@@ -73,10 +73,10 @@ const char* load_compute_translation(ComputeTranslation& tr)
     wchar_t path[MAX_PATH];
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt") || !read_text(path, manifest)) {
-        tr.retry_manifest_at = GetTickCount64() + 1000;
+        tr.manifest_retry.missed(GetTickCount64());
         return nullptr;
     }
-    tr.retry_manifest_at = 0;
+    tr.manifest_retry.found();
     unsigned declared_uds = 0, line_number = 0;
     for (std::size_t at = 0; at < manifest.size(); ++line_number) {
         std::size_t end = manifest.find('\n', at);
@@ -203,7 +203,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
-        if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
+        if (!tr->state || tr->manifest_retry.due(GetTickCount64())) {
             tr->unmodelled = load_compute_translation(*tr);
             if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }

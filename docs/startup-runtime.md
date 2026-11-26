@@ -873,7 +873,11 @@ the debugger and stops it, with its worker processes, when the debugger returns 
 without `-Render` is ignored with a warning). The watcher repeats the `--pending` scan every
 2 seconds (`--watch <dir> <seconds>` sets another interval), so a pipeline the title creates during
 the run is translated within seconds, and the runtime picks it up on a later draw instead of on the
-next run. The cache persists: a later run reads every published `<key>.txt` and translates only new
+next run. The runtime looks for an absent manifest again 1 second after the first miss and doubles
+the wait with each further miss up to 32 seconds. A translation published during the run is therefore
+used on a draw or Dispatch at most 32 seconds later, and a key that never gets a translation costs one
+cache lookup every 32 seconds instead of one per second (each lookup holds `draw_lock`, which every draw
+and Dispatch takes). The cache persists: a later run reads every published `<key>.txt` and translates only new
 requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
 requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
 ready marker is not retried during the run (the runtime writes each request once and never rewrites

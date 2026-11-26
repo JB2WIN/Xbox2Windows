@@ -137,7 +137,7 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits, d16_unorm16, desc_word3 };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
-    ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
+    x2w_startup::ManifestRetry manifest_retry;  // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<PixelUav> uavs;              // manifest 'uav N tex2d table P O' (#1996 F): u0.. after the SRVs
     std::vector<Ud> uds;
@@ -265,18 +265,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!read_text(path, manifest)) {
-        if (!tr.retry_manifest_at) {
+        if (!tr.manifest_retry.pending()) {
             InterlockedIncrement(&translation_missing);
             static LONG missing;
             if (rtv_request.empty() && first_calls(missing, 12))
                 log("x2w-draw no translation for pipeline %016llx", tr.key);
         }
-        tr.retry_manifest_at = GetTickCount64() + 1000;
+        tr.manifest_retry.missed(GetTickCount64());
         return;
     }
     // The writer publishes this marker last. A malformed published result stays rejected.
-    const bool previously_missing = tr.retry_manifest_at != 0;
-    tr.retry_manifest_at = 0;
+    const bool previously_missing = tr.manifest_retry.pending();
+    tr.manifest_retry.found();
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -896,7 +896,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
     if (!base) return nullptr;
     if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
-        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+        if (base->manifest_retry.due(GetTickCount64()))
             load_translation(*base);
         return base;
     }
@@ -913,7 +913,7 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
-    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
+    } else if (entry->manifest_retry.due(GetTickCount64())) {
         load_translation(*entry, request);
     }
     return entry;

@@ -17,6 +17,7 @@
 #include "xmem_page_batch.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/manifest_retry.h"
 #include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
