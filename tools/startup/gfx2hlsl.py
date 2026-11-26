@@ -1913,6 +1913,15 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                     pending.append(i + 1)
         return False
 
+    def dead_block_scalar(i, join):
+        """Scalar ALU in a skipped block whose results no path reads past the join. Lanes that skip the block per lane
+        never read them, and lanes that run it compute the wave-uniform values the guest computes once per wave."""
+        name, asm = ins[i][2:]
+        if name in MESH_WAVE_BLOCK_LOADS or not name.startswith('s_') or not mesh_wave_block_scalar(name, asm):
+            return False
+        _, must, may = scalar_effects(name, asm)
+        return not any(live_at_join(reg, join) for reg in must | may)
+
     for source, target in edges.items():
         if ins[source][2] == 's_cbranch_execz':
             # A single scalar shift followed by a full EXEC restore has a separate wave-level proof below.
@@ -1968,7 +1977,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits, wave_loads):
                 if not (no_effect(i) or name == 'exp'
                         or (name == 's_branch' and edges[i] >= target
                             and all(no_effect(k) for k in range(target, edges[i])))
-                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))):
+                        or lane_only(i) or (source == count_entry_branch and dead_count_entry_scalar(i))
+                        or dead_block_scalar(i, target)):
                     raise Unsupported(execz_effects)
         elif any(ins[i][2] == 'exp' for i in range(source + 1, target)):
             raise Unsupported('slot 57 mesh: a branch bypasses an export')
