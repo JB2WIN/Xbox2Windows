@@ -35,6 +35,18 @@ def main(probe, sdk, adapter):
         result = subprocess.run([probe, adapter, sdk, str(work / "probe"), flags.group(1)], capture_output=True, text=True)
         print(result.stdout, end="")
         print(result.stderr, end="")
+        if result.returncode not in (0, 77):
+            # Show how the two containers differ (module, shader flags, pipeline state validation data).
+            import difflib
+            listings = {}
+            for name in ("reference", "native"):
+                container = work / "probe" / f"{name}.dxil"
+                if container.exists():
+                    listings[name] = subprocess.run([str(Path(sdk) / "dxc.exe"), "-dumpbin", str(container)],
+                                                    capture_output=True, text=True).stdout.splitlines()
+            if len(listings) == 2:
+                diff = list(difflib.unified_diff(listings["reference"], listings["native"], "reference", "native", lineterm="", n=1))
+                print("\n".join(diff[:160]))
         if result.returncode == 77:
             return 77
         assert result.returncode == 0, f"probe exit {result.returncode}"

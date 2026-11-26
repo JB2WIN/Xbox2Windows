@@ -162,6 +162,12 @@ int wmain(int argc, wchar_t **argv) {
             return 3;
         }
 
+        // Both containers go to the work directory so the check script can print how they differ.
+        for (const auto &[name, shader] : {std::pair<const char *, const x2w::CompiledShader *>{"reference.dxil", &reference},
+                                           std::pair<const char *, const x2w::CompiledShader *>{"native.dxil", &native}})
+            std::ofstream(work / name, std::ios::binary)
+                .write(reinterpret_cast<const char *>(shader->dxil.data()), static_cast<std::streamsize>(shader->dxil.size()));
+
         // Root signature: root SRV t0 (selector), root UAV u0 (output), and the heap indexed directly.
         D3D12_ROOT_PARAMETER1 parameters[2]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
