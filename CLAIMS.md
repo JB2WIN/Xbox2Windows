@@ -17,3 +17,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/release-retained-textures (#2379 deferred release) | PC-Joshua | 2026-11-25 14:23 | local prototype, issue opened |
 | startup/compute-manifest-retry (compute manifest retry under draw_lock) | PC-Joshua | 2026-11-26 20:39 | local diagnosis, fix in prep |
 | tests/native-wave-request-refusal (cpp-migration wave_request refusal message) | PC-Joshua | 2026-11-26 21:36 | fix in prep |
+| native/global-srv-heap-replay (#2908 capture+replay fixture) | PC-Joshua | 2026-11-26 21:53 | taken over from tedin7 #2912 |
