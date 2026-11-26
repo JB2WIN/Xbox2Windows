@@ -1930,6 +1930,18 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_direct_container_check.py" --graphics-sampler-pso
         "${DXC_BIN_DIR}" "$<TARGET_FILE:native_recording_check>")
     set_tests_properties(native_graphics_comparison_pso_warp PROPERTIES SKIP_RETURN_CODE 77)
+    # Cycle 1 of the global SRV work: ResourceDescriptorHeap[index] from a native DXIL module against a DXC reference.
+    add_executable(native_heap_handle_probe tests/native_heap_handle_probe.cpp)
+    target_include_directories(native_heap_handle_probe PRIVATE src)
+    target_compile_features(native_heap_handle_probe PRIVATE cxx_std_17)
+    target_link_libraries(native_heap_handle_probe PRIVATE x2w_shader_compiler dxgi d3d12)
+    set_property(TARGET native_heap_handle_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME native_heap_handle_probe_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/native_heap_handle_probe_check.py" "$<TARGET_FILE:native_heap_handle_probe>"
+            "${DXC_BIN_DIR}" ${adapter})
+        set_tests_properties(native_heap_handle_probe_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endforeach()
     add_test(NAME native_recording_pages_warp COMMAND native_recording_check)
     add_test(NAME native_dispatch_states_warp COMMAND native_recording_check --subresources)
     set_tests_properties(native_dispatch_states_warp PROPERTIES SKIP_RETURN_CODE 77)

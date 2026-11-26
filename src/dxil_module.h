@@ -24,6 +24,7 @@ class DxilModule {
     };
     std::ostringstream body, setup, globals;
     bool uses_wave = false;
+    bool heap_used = false;
     unsigned features = 0;
     struct Signature {
         Text name;
@@ -141,6 +142,18 @@ class DxilModule {
             << " })\n";
         return h;
     }
+    // A handle taken from the descriptor heap at a run-time index (SM 6.6 ResourceDescriptorHeap[index]), annotated with
+    // the view class the shader reads: `kind` is the DXIL resource kind (11 raw buffer, 2 Texture2D) and `props` the
+    // second ResourceProperties word. No resource record is declared: the binding is the whole heap.
+    Text heap_handle(const Text &index, unsigned kind, unsigned props, bool uav = false) {
+        heap_used = true;
+        const Text h = "%heap" + std::to_string(sequence++);
+        body << "  " << h << "b = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 " << index
+             << ", i1 false, i1 true)\n"
+             << "  " << h << " = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle " << h
+             << "b, %dx.types.ResourceProperties { i32 " << (kind + (uav ? 4096 : 0)) << ", i32 " << props << " })\n";
+        return h;
+    }
     Text finish_compute(unsigned x, unsigned y, unsigned z, const Text &stage = "cs") {
         std::ostringstream out;
         out << "target datalayout = "
@@ -256,6 +269,12 @@ class DxilModule {
         out << globals.str() << "define void @main() {\nentry:\n" << setup.str() << body.str() << "}\n";
         for (auto &[name, decl] : declarations)
             out << decl << "\n";
+        if (heap_used) {
+            out << "declare %dx.types.Handle @dx.op.createHandleFromHeap(i32,i32,i1,i1) nounwind readnone\n";
+            if (resources.empty())
+                out << "declare %dx.types.Handle "
+                       "@dx.op.annotateHandle(i32,%dx.types.Handle,%dx.types.ResourceProperties) nounwind readnone\n";
+        }
         if (!resources.empty())
             out << "declare %dx.types.Handle @dx.op.createHandleFromBinding(i32,%dx.types.ResBind,i32,i1) nounwind "
                    "readnone\n"
