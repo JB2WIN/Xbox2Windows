@@ -16,3 +16,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/gfx2hlsl-sopk-addk-mulk (s_addk_i32, s_mulk_i32 in gfx2hlsl, #1723) | PC-Joshua | 2026-11-25 00:08 | claimed in #1723 |
 | startup/release-retained-textures (#2379 deferred release) | PC-Joshua | 2026-11-25 14:23 | local prototype, issue opened |
 | startup/compute-typed-buffer-store (C200-03, compute buffer_store_format) | PC-Joshua | 2026-11-26 01:37 | claimed for #2618 C200-03; fixture first |
+| startup/gfx2hlsl-bfm-b64 (#2007, merge main via Ybucaille) | PC-Joshua | 2026-11-26 04:40 | verify a73b60f8 on Windows, then ff push |
