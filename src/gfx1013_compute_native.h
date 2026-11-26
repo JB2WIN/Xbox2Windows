@@ -34,9 +34,12 @@ enum class ComputeViewKind {
     cube_comparison_srv,
     indexed_atomic_uav,
     d16_sample_srv,
-    byte_window_srv
+    byte_window_srv,
+    heap_buffer_srv // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
 };
 inline constexpr unsigned compute_resource_heap = ~0u;
+// A binding of the whole descriptor heap: it has no table register and no root parameter.
+inline bool compute_heap_binding(ComputeViewKind kind) { return kind == ComputeViewKind::heap_buffer_srv; }
 inline bool compute_buffer_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::typed_buffer_uav ||
            kind == ComputeViewKind::half_buffer_uav || kind == ComputeViewKind::indexed_atomic_uav;

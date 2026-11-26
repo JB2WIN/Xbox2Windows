@@ -247,10 +247,38 @@ struct DirectCompute {
             }
         }
     }
+    // A raw buffer SRV chosen by a GPU value in the whole descriptor heap: ResourceDescriptorHeap[slot]. The view class the
+    // shader reads is the one this handle is annotated with (raw buffer); a slot holding another class is refused by the
+    // dispatch before the shader runs. The binding names the heap (no table register); the pipeline indexes it directly.
+    string heap_resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes) {
+        const auto &symbol = s.at(base);
+        if (kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv)
+            refuse(i.pc, "a GPU-selected heap slot is read as a raw buffer SRV only");
+        if (symbol.offset % 32 || s[base].type != Symbol::Type::indexed_descriptor)
+            refuse(i.pc, "unaligned heap descriptor");
+        for (unsigned j = 1; j < 4; ++j) {
+            Symbol expected = symbol;
+            expected.offset += 4 * j;
+            if (!(s.at(base + j) == expected))
+                refuse(i.pc, "non-contiguous resource descriptor");
+        }
+        auto &bindings = analysis.result.bindings;
+        auto it = std::find_if(bindings.begin(), bindings.end(), [](const auto &b) {
+            return b.kind == ComputeViewKind::heap_buffer_srv;
+        });
+        if (it == bindings.end())
+            bindings.push_back({ComputeViewKind::heap_buffer_srv, compute_resource_heap, 0, 0, bytes});
+        else
+            it->required_bytes = (std::max)(it->required_bytes, bytes);
+        ir.features |= 16;
+        return ir.heap_handle(ir.binary("add", read(base), to_string(symbol.offset / 32)), 11, 0);
+    }
     string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
                     unsigned *bound_register = nullptr) {
         const auto &symbol = s.at(base);
         const bool indexed = symbol.type == Symbol::Type::indexed_descriptor;
+        if (indexed && symbol.value == compute_resource_heap)
+            return heap_resource(i, s, base, kind, bytes);
         const unsigned count = indexed ? 1 + symbol.index_mask / 32 : 1;
         analysis.binding(i, s, base, 4, kind, bytes);
         auto it = std::find_if(analysis.result.bindings.begin(), analysis.result.bindings.end(), [&](const auto &b) {

@@ -32,6 +32,10 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
 
     UINT counts[2]{};
     for (const auto &binding : pipeline.bindings) {
+        if (compute_heap_binding(binding.kind)) {
+            pipeline.heap_indexed = true; // ResourceDescriptorHeap reads: no table register
+            continue;
+        }
         auto &count = counts[is_uav(binding)];
         if (binding.shader_register != count++)
             throw std::runtime_error("noncontiguous compute register range");
@@ -82,7 +86,9 @@ NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, Shade
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param.Constants = {b.shader_register + 1, 0, 2};
     }
-    D3D12_ROOT_SIGNATURE_DESC desc{param_count, params.data(), static_cast<UINT>(samplers.size()), samplers.data()};
+    D3D12_ROOT_SIGNATURE_DESC desc{param_count, params.data(), static_cast<UINT>(samplers.size()), samplers.data(),
+                                   pipeline.heap_indexed ? static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x400) // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                                                         : D3D12_ROOT_SIGNATURE_FLAG_NONE};
     Microsoft::WRL::ComPtr<ID3DBlob> blob;
     if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)) ||
         FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -104,7 +110,7 @@ void NativeComputePipeline::bind(ID3D12GraphicsCommandList *list, ID3D12Descript
         throw std::runtime_error("compute root constants missing");
     if (atomic.size() != atomic_views)
         throw std::runtime_error("indexed atomic view metadata missing");
-    if (srv_count || uav_count)
+    if (srv_count || uav_count || heap_indexed)
         list->SetDescriptorHeaps(1, &heap);
     list->SetComputeRootSignature(root.Get());
     list->SetPipelineState(state.Get());
