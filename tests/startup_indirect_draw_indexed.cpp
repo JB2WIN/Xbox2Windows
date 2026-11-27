@@ -1968,8 +1968,13 @@ static int native_fixed_mesh_fixture(ID3D12Device* device, ID3D12Device* guest, 
     const bool buffers = heap || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_BUFFERS", nullptr, 0) != 0;
     const bool constants = buffers || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_CONSTANT", nullptr, 0) != 0;
     const bool varying = constants || GetEnvironmentVariableA("X2W_TEST_NATIVE_MESH57_VARYING", nullptr, 0) != 0;
-    const auto cache = std::filesystem::current_path() / ("mesh57-native-" + std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(cache);
+    // Windows recycles process IDs. Retain failed runs for inspection without reading an old archive.
+    const auto prefix = "mesh57-native-" + std::to_string(GetCurrentProcessId()) + "-";
+    std::filesystem::path cache;
+    for (unsigned attempt = 0; ; ++attempt) {
+        cache = std::filesystem::current_path() / (prefix + std::to_string(attempt));
+        if (std::filesystem::create_directory(cache)) break;
+    }
     check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "native mesh cache");
     ComPtr<ID3DBlob> blob;
     D3D12_ROOT_SIGNATURE_DESC empty{};
@@ -2240,7 +2245,9 @@ static int native_fixed_mesh_fixture(ID3D12Device* device, ID3D12Device* guest, 
             else return 1;
         }
     std::printf("fixed mesh state archives matching creation bytes: accepted=%d refused=%d\n", saw_valid, saw_other);
-    return saw_valid && saw_other ? 0 : 1;
+    if (!saw_valid || !saw_other) return 1;
+    std::filesystem::remove_all(cache);
+    return 0;
 }
 
 int main(int argc, char** argv) try
