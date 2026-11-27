@@ -17775,3 +17775,5 @@ python -B tests/docs_links_check.py
 
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
+
+See [fixed mesh pipelines through slot 57](experiments/native-fixed-mesh57.md) for the source-built indirect-draw fixtures.
