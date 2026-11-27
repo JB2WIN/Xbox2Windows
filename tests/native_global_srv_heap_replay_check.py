@@ -545,8 +545,18 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
                                "global SRV slot 9 has no captured view type"),
         "mixed_unreadable": (MIXED, MV.replace("also 3 typed_buffer", "also x y"),
                              "global SRV view metadata: unreadable also line"),
-        "mixed_duplicate": (MIXED, MV.replace("also 3 typed_buffer", "also 0 typed_buffer"),
-                            "global SRV view metadata: duplicate selected slot 0"),
+        "mixed_trailing_field": (MIXED, MV.replace("also 3 typed_buffer", "also 3 typed_buffer 7"),
+                                 "global SRV view metadata: unreadable also line"),
+        # The selected slot 0 (raw_buffer) named again with another view type; the same slot twice with the same type
+        # is accepted (positives below).
+        "mixed_two_types": (MIXED, MV + "also 0 typed_buffer\n",
+                            "global SRV view metadata: slot 0 selected with two view types"),
+        "mixed_two_types_also": (MIXED, MV + "also 3 raw_buffer\n",
+                                 "global SRV view metadata: slot 3 selected with two view types"),
+        # Only the second `also` is wrong: the first still holds the valid typed slot 3.
+        "mixed_second_also_wrong_type": (MIXED, MV + "also 2 raw_buffer\n", RAW.format(n=2, t="texture")),
+        "mixed_second_also_texture": (MIXED, MV + "also 2 texture\n",
+                                      "GPU-selected heap slot view type texture is not raw_buffer or typed_buffer"),
         "mixed_no_dword": (MIXED, MV.replace("dword 3 1\n", ""),
                            "GPU-selected heap slot 3 is not a one-channel 32-bit typed buffer (no 32-bit channel metadata)"),
         "mixed_typed_xy": (typed_xy, MV, "typed heap load reads one channel only"),
@@ -563,6 +573,8 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     # windows by the rewrite, a formatted tbuffer load through a plain or rewritten heap descriptor).
     mixed_positives = {
         "mixed_two_also": (MIXED, MV + "also 1 raw_buffer\n"),
+        "mixed_also_same_slot": (MIXED, MV + "also 0 raw_buffer\n"),  # select 0 again, same type
+        "mixed_also_twice": (MIXED, MV + "also 3 typed_buffer\n"),  # a repeated also, same type
         "mixed_window": (WINDOW, MV),
         "mixed_twindow": (TWINDOW, MV),
         # tbuffer_load_format_x v2, v1, s[20:23], 0 format:[BUF_FMT_32_UINT] offen: refused under typed_dword
@@ -576,5 +588,38 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
                 f"compile_dxil '{name}': compiled under the mixed contract")
         if name == "mixed_two_also":
             require("also=3:typed_buffer also=1:raw_buffer" in out, "compile_dxil 'mixed_two_also': reports both also entries")
+        if name == "mixed_also_same_slot":
+            require("also=3:typed_buffer also=0:raw_buffer" in out, "compile_dxil 'mixed_also_same_slot': reports both also entries")
+        if name == "mixed_also_twice":
+            require("also=3:typed_buffer also=3:typed_buffer" in out, "compile_dxil 'mixed_also_twice': reports both also entries")
+
+    # Two selector words that pick the same raw slot: both words are selections of the same view type, so the file
+    # `record` writes decodes, and `replay` writes the slot to both words. RAWRAW is MIXED with the typed load of word 1
+    # replaced by a raw load (buffer_load_dword v3, v1, s[24:27], 0 offen), so u0 is twice the slot's data.
+    RAWRAW = list(MIXED)
+    typed_at = RAWRAW.index(0xe0002000)
+    RAWRAW[typed_at:typed_at + 2] = [0xe0301000, 0x80060301]
+    directory, rawraw_stem = typed_dir("rawraw", RAWRAW)
+    code, out, err = run([fixture, "record", sdk, cache, directory / (rawraw_stem + ".cdx"), adapter, 0, "ok",
+                          "--need", "raw_buffer", "--also", 0, "raw_buffer"])
+    require(code == 0 and "output matches slot 0+0 data" in out,
+            "record two raw selections of slot 0: u0 equals twice the slot 0 data")
+    text = (directory / (rawraw_stem + ".views")).read_text()
+    require(text.startswith("x2w-global-srv-views 2\nselect 0\nneed raw_buffer\nalso 0 raw_buffer\n"),
+            "record two raw selections of slot 0 wrote the repeated slot")
+    code, out, err, rawraw_cso = typed_compile(directory, rawraw_stem, "rawraw_out", cache_dir=cache11)
+    require(code == 0 and "global_srv select=0 need=raw_buffer also=0:raw_buffer" in out and rawraw_cso.exists(),
+            "compile_dxil two raw selections of slot 0: the file record wrote decodes and compiles")
+    code, out, err = run([fixture, "replay", sdk, cache, directory / (rawraw_stem + ".cdx"), rawraw_cso,
+                          directory / (rawraw_stem + ".views"), adapter, "ok", "0+0"])
+    require(code == 0 and "output matches slot 0+0 data" in out, "replay two raw selections of slot 0: twice the slot data")
+    code, out, err = run([fixture, "replay", sdk, cache, directory / (rawraw_stem + ".cdx"), rawraw_cso,
+                          directory / (rawraw_stem + ".views"), adapter, "ok", "0+1"])
+    require(code == 1 and "mismatch word 0" in out, "replay two raw selections of slot 0 compared with slots 0+1 reports a mismatch")
+
+    # A non-numeric --also selector is a usage error (exit 2), like the other bad arguments.
+    code, out, err = run([fixture, "record", sdk, cache, directory / (rawraw_stem + ".cdx"), adapter, 0, "ok",
+                          "--also", "x", "raw_buffer"])
+    require(code == 2, "record with a non-numeric --also selector exits 2")
 
 print("native_global_srv_heap_replay: all checks passed")

@@ -378,7 +378,11 @@ int record(int argc, wchar_t **argv) {
             if (needed == GlobalSrvType::none) return 2;
         } else if (flag == L"--also" && a + 2 < argc && !also_given) {
             also_given = true;
-            also_selector = static_cast<unsigned>(std::stoul(argv[++a]));
+            try {
+                also_selector = static_cast<unsigned>(std::stoul(argv[++a]));
+            } catch (const std::exception &) {
+                return 2;
+            }
             also_needed = type_from_argument(argv[++a]);
             if (also_needed == GlobalSrvType::none) return 2;
         } else {

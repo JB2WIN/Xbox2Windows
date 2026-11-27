@@ -129,7 +129,8 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
         } else if (key == "also") {
             GlobalSrvSelection selection;
             std::string name;
-            if (!(fields >> selection.slot >> name)) {
+            std::string extra;
+            if (!(fields >> selection.slot >> name) || (fields >> extra)) {
                 error = "global SRV view metadata: unreadable also line";
                 return false;
             }
@@ -174,13 +175,14 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
         error = std::string("global SRV view metadata lacks the ") + (request.has_selected ? "needed view type" : "selected slot");
         return false;
     }
-    // One selection per selector word: a slot named twice is refused, also with the same type (a producer deduplicates).
+    // One selection per selector word, so a slot may be named again (two words can pick the same slot) with the same
+    // view type. A slot named with two view types cannot be read as both: refused.
     for (std::size_t a = 0; a <= request.also.size(); ++a)
         for (std::size_t b = a + 1; b <= request.also.size(); ++b) {
-            const unsigned slot_a = a ? request.also[a - 1].slot : request.selected;
-            const unsigned slot_b = request.also[b - 1].slot;
-            if (slot_a == slot_b) {
-                error = "global SRV view metadata: duplicate selected slot " + std::to_string(slot_a);
+            const auto &first = a ? request.also[a - 1] : GlobalSrvSelection{request.selected, request.needed};
+            const auto &second = request.also[b - 1];
+            if (first.slot == second.slot && first.needed != second.needed) {
+                error = "global SRV view metadata: slot " + std::to_string(first.slot) + " selected with two view types";
                 return false;
             }
         }

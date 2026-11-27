@@ -1678,10 +1678,11 @@ struct DirectCompute {
             const auto field = source(i, i.src[1], state);
             if (descriptor.type == Symbol::Type::indexed_descriptor && descriptor.value == compute_resource_heap &&
                 descriptor.offset % 32 == 4 && field.type == Symbol::Type::constant && field.value == 0xe0010) {
-                // Reachable only through a heap descriptor load, which needs the raw_buffer or raw_and_typed_dword
-                // contract. A raw buffer view has no stride to read, so the stride of a GPU-selected slot stays
-                // untranslated in the direct path. With either contract a stride read into s0-s105 is tracked
-                // symbolically (byte_descriptor_field) and does not reach here.
+                // Reachable only through a heap descriptor load, which needs the raw_buffer, typed_dword or
+                // raw_and_typed_dword contract. A raw buffer view has no stride to read, so the stride of a
+                // GPU-selected slot stays untranslated in the direct path. Under raw_buffer and raw_and_typed_dword
+                // a stride read into s0-s105 is tracked symbolically (byte_descriptor_field) and does not reach
+                // here; typed_dword admits the heap descriptor load but not that tracking, so it reaches this refusal.
                 refuse_heap_contract(i.pc);
                 refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }
