@@ -35,11 +35,14 @@ enum class ComputeViewKind {
     indexed_atomic_uav,
     d16_sample_srv,
     byte_window_srv,
-    heap_buffer_srv // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    heap_buffer_srv, // A raw buffer read through ResourceDescriptorHeap[slot]; the slot is a GPU value.
+    heap_typed_srv   // A one-channel 32-bit typed buffer read the same way (HeapViewContract::typed_dword).
 };
 inline constexpr unsigned compute_resource_heap = ~0u;
 // A binding of the whole descriptor heap: it has no table register and no root parameter.
-inline bool compute_heap_binding(ComputeViewKind kind) { return kind == ComputeViewKind::heap_buffer_srv; }
+inline bool compute_heap_binding(ComputeViewKind kind) {
+    return kind == ComputeViewKind::heap_buffer_srv || kind == ComputeViewKind::heap_typed_srv;
+}
 inline bool compute_buffer_uav(ComputeViewKind kind) {
     return kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::typed_buffer_uav ||
            kind == ComputeViewKind::half_buffer_uav || kind == ComputeViewKind::indexed_atomic_uav;
@@ -117,7 +120,13 @@ struct NativeComputeShader {
 // every slot the program can select is a raw view whose size is the guest range num_records * max(stride, 1); the
 // translator does not check that, nor the swizzle bits (word 1 bits 31:30) or the other word 3 fields, and a program
 // with two heap loads from different selectors is outside what one captured selection covers.
-enum class HeapViewContract : unsigned { none, raw_buffer, other };
+// typed_dword: only typed loads (buffer_load_format_x, an idxen element index or none, no offsets) read the heap; raw
+// loads and byte windows are refused. The caller guarantees that every slot the program can select is a typed buffer SRV
+// of R32_UINT, R32_SINT or R32_FLOAT (default mapping, no flags, no structure stride), bound as R32_UINT over the same
+// resource and element range, and that the guest descriptor it stands for has stride 4, a 32-bit UINT/SINT/FLOAT data
+// format, identity dst_sel_x, swizzle and add_tid disabled, and the out-of-bounds rule "index >= num_records reads 0",
+// with num_records equal to the view's element count. The translator checks none of these values.
+enum class HeapViewContract : unsigned { none, raw_buffer, typed_dword, other };
 NativeComputeShader translate_compute(const ComputeRequest &request, unsigned entry_byte_offset,
                                       bool direct_dxil = false);
 NativeComputeShader translate_compute_container(ComputeContainer container,
