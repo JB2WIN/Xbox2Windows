@@ -258,13 +258,16 @@ bool translate_compute_natively(ComputeTranslation& tr)
         for (const auto& view : program.bindings) {
             const bool packed_x = view.kind == x2w::ComputeViewKind::packed_d16_x_uav;
             const bool half_typed = packed_x || view.kind == x2w::ComputeViewKind::half_buffer_uav;
-            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed;
+            const bool texture_input = view.kind == x2w::ComputeViewKind::texture_srv && view.image_dimension == 1;
+            const bool volume = view.kind == x2w::ComputeViewKind::texture_uav && view.image_dimension == 2;
+            const bool output = view.kind == x2w::ComputeViewKind::raw_buffer_uav || half_typed || volume;
             auto& slots = output ? tr.uavs : tr.srvs;
-            if ((!output && view.kind != x2w::ComputeViewKind::raw_vector_srv && !x2w::accepts_cbv_window(view.kind)) || view.array_count != 1 ||
+            if ((!output && !texture_input && view.kind != x2w::ComputeViewKind::raw_vector_srv && !x2w::accepts_cbv_window(view.kind)) || view.array_count != 1 ||
                 view.root_parameter >= 16 || view.shader_register != slots.size())
                 throw std::runtime_error("view kind " + std::to_string(static_cast<unsigned>(view.kind)) +
                                          " is not bound for a natively translated program");
-            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset)});
+            slots.push_back({static_cast<int>(view.root_parameter), static_cast<int>(view.byte_offset), volume || texture_input});
+            if (volume) slots.back().uav_dimension = D3D12_UAV_DIMENSION_TEXTURE3D;
             slots.back().half_typed_bytes = half_typed ? view.required_bytes : 0;
             slots.back().packed_d16_x = packed_x;
             if (x2w::accepts_cbv_window(view.kind))
