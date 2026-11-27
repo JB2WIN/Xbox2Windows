@@ -5,6 +5,7 @@
 #include "gfx1013_vertex_id.h"
 #include "gfx1013_compute_clear.h"
 #include "gfx1013_compute_native.h"
+#include "startup_stubs/native_global_srv.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,36 @@ static void compile_source(x2w::ShaderDxilCompiler& compiler,const std::string& 
     }
 }
 
+// The view metadata captured with a compute request (req_<key>.views), read before the program is translated. Absent:
+// the request has no captured selection and a GPU-selected heap read is refused. Present: every refusal below happens
+// before any output is published.
+struct CapturedViews {
+    x2w::HeapViewContract contract = x2w::HeapViewContract::none;
+    x2w_startup::GlobalSrvRequest request;
+    bool present = false;
+};
+
+static CapturedViews read_captured_views(const fs::path& request_path) {
+    CapturedViews views;
+    const auto path = fs::path(request_path).replace_extension(L".views");
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return views;
+    std::string text((std::istreambuf_iterator<char>(file)), {});
+    if (file.bad()) throw std::runtime_error("global SRV view metadata read failed");
+    std::string error;
+    if (!x2w_startup::decode_global_srv_request(text, views.request, error)) throw std::runtime_error(error);
+    views.present = true;
+    const auto& request = views.request;
+    auto refusal = x2w_startup::refuse_global_srv_selection(request.views, request.selected, request.needed);
+    if (!refusal.empty()) throw std::runtime_error(refusal);
+    if (request.needed != x2w_startup::GlobalSrvType::raw_buffer)
+        throw std::runtime_error(std::string("GPU-selected heap slot view type ") +
+                                 x2w_startup::global_srv_type_name(request.needed) +
+                                 " is not raw_buffer; only raw buffer heap reads are translated");
+    views.contract = x2w::HeapViewContract::raw_buffer;
+    return views;
+}
+
 static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile, const fs::path& input_path,
                         const fs::path& destination, const fs::path& cache, std::ostream& report,const x2w::NativeComputeShader *linked=nullptr) {
     Clock::time_point start;
@@ -64,7 +95,9 @@ static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile,
         start=Clock::now();
         const auto entry=static_cast<unsigned>(std::stoul(offset));
         bool frontend_hit=false;
-        auto program=direct?x2w::prepare_direct_compute(input_path,entry,container,cache,frontend_hit)
+        CapturedViews views;
+        if(container)views=read_captured_views(input_path);
+        auto program=direct?x2w::prepare_direct_compute(input_path,entry,container,cache,frontend_hit,views.contract)
                            :x2w::translate_compute(x2w::read_compute_request(input_path),entry,false);
         report<<"frontend=native_cpp instructions="<<program.instruction_count<<" frontend_cache_hit="<<frontend_hit
               <<" request_and_translation_ms="<<elapsed_ms(start)<<"\n";
@@ -76,6 +109,15 @@ static void compile_one(x2w::ShaderDxilCompiler& compiler, std::wstring profile,
             if (b.scalar_table == Table::declared_cbv) report << " table_view=declared-cbv";
             if (b.scalar_table == Table::srv) report << " table_view=srv";
             report << '\n';
+        }
+        if(views.present){
+            const bool heap_read=std::any_of(program.bindings.begin(),program.bindings.end(),[](const auto& b){
+                return b.kind==x2w::ComputeViewKind::heap_buffer_srv || b.kind==x2w::ComputeViewKind::heap_stride_srv;});
+            if(heap_read){
+                auto refusal=x2w_startup::refuse_global_srv_selection(views.request.views,views.request.selected,views.request.needed);
+                if(!refusal.empty())throw std::runtime_error(refusal);
+            }
+            report<<"global_srv select="<<views.request.selected<<" need="<<x2w_startup::global_srv_type_name(views.request.needed)<<'\n';
         }
         source=direct?std::move(program.dxil_ir):std::move(program.hlsl);profile=L"cs_6_6";
     } else if (profile.compare(0,clear_prefix.size(),clear_prefix)==0) {
@@ -162,6 +204,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-buffered-pair takes a buffered vertex program and a pixel HLSL source.\n"
                      "gfx1013-group-clear@BYTE_OFFSET and gfx1013-compute-wave32@BYTE_OFFSET take a req_<key>.c67.\n"
                      "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps.\n"
+                     "gfx1013-container-cs reads an optional req_<key>.views next to the .cdx (GPU-selected heap slot view types).\n"
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
                      "gfx1013-container-rect also emits the rectangle geometry stage.\n"
@@ -230,7 +273,7 @@ int wmain(int argc, wchar_t** argv) {
         std::set<fs::path,PathLess> occupied(inputs.begin(),inputs.end());
         if(compute_request) {
             for(const auto& input : inputs) {
-                for(auto suffix : {L".root",L".data",L".sa",L".sb",L".desc"})
+                for(auto suffix : {L".root",L".data",L".sa",L".sb",L".desc",L".views"})
                     occupied.insert(fs::weakly_canonical(fs::path(input).replace_extension(suffix)));
             }
         }

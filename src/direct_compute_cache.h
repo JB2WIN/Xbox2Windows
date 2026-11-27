@@ -8,7 +8,8 @@ size_t index_graphics_interfaces(const std::filesystem::path &source, const std:
 // Signature component (f32/u32/i32) for supported typed IA and RTV formats.
 unsigned dxil_io_component(unsigned dxgi_format);
 NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, unsigned entry, bool container,
-                                           const std::filesystem::path &cache, bool &cache_hit);
+                                           const std::filesystem::path &cache, bool &cache_hit,
+                                           HeapViewContract heap_view = HeapViewContract::none);
 DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view b,
                                           const std::filesystem::path &cache, bool &cache_hit,
                                           std::string_view root = {}, std::string_view input_layout = {},

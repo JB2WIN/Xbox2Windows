@@ -16,11 +16,14 @@ bool is_uav(const ComputeViewBinding &binding) { return compute_uav(binding.kind
 
 NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, ShaderDxilCompiler &compiler,
                                                      const std::filesystem::path &marker, unsigned entry,
-                                                     const std::filesystem::path &cache, bool direct_dxil) {
+                                                     const std::filesystem::path &cache, bool direct_dxil,
+                                                     HeapViewContract heap_view) {
+    if (!direct_dxil && heap_view != HeapViewContract::none)
+        throw std::runtime_error("a heap view contract needs the direct DXIL path");
     NativeComputePipeline pipeline;
     auto start = Clock::now();
     auto program = direct_dxil
-        ? prepare_direct_compute(marker,entry,marker.extension()==L".cdx",cache,pipeline.frontend_cache_hit)
+        ? prepare_direct_compute(marker,entry,marker.extension()==L".cdx",cache,pipeline.frontend_cache_hit,heap_view)
         : translate_compute(read_compute_request(marker), entry, direct_dxil);
     pipeline.instructions = program.instruction_count;
     pipeline.bindings = std::move(program.bindings);

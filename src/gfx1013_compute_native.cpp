@@ -1351,7 +1351,8 @@ void lower_blocks(Emit &e) {
 #include "gfx1013_direct_compute.inl"
 #include "gfx1013_direct_graphics.inl"
 } // namespace
-static NativeComputeShader translate_program(const ComputeRequest &request, unsigned entry, bool direct_dxil, const GuestShaderStage *stage) {
+static NativeComputeShader translate_program(const ComputeRequest &request, unsigned entry, bool direct_dxil, const GuestShaderStage *stage,
+                                             HeapViewContract heap_view) {
     if (entry == 36 && ((word(request.code, 0) >> 16) != 0xd580 || (word(request.code, 12) >> 16) != 0xd580 ||
                         (word(request.code, 24) >> 16) != 0xd580 || (word(request.code, 36) >> 16) != 0xbfa0))
         refuse(entry, "unrecognized compute header");
@@ -1464,6 +1465,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     if (direct_dxil) {
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
+        compiler.heap_view = heap_view;
         if (wave64 && threads % 64) refuse(entry, "wave64 exchange requires complete guest waves");
         if (wave64 && threads > 64) {
             const auto &code = program.code;
@@ -1635,10 +1637,10 @@ void x2w::apply_scalar_table_layout(ComputeViewBinding &binding, const D3D12_ROO
 }
 
 x2w::NativeComputeShader x2w::translate_compute(const ComputeRequest &request, unsigned entry, bool direct_dxil) {
-    return translate_program(request, entry, direct_dxil, nullptr);
+    return translate_program(request, entry, direct_dxil, nullptr, HeapViewContract::none);
 }
 
-x2w::NativeComputeShader x2w::translate_compute_container(ComputeContainer container) {
+x2w::NativeComputeShader x2w::translate_compute_container(ComputeContainer container, HeapViewContract heap_view) {
     auto stages = read_guest_shader_container(container.bytes);
     GuestShaderStage *compute = nullptr;
     for (auto &stage : stages) {
@@ -1650,7 +1652,7 @@ x2w::NativeComputeShader x2w::translate_compute_container(ComputeContainer conta
     ComputeRequest request{};
     request.code = std::move(compute->code);
     request.root = std::move(container.root);
-    return translate_program(request, 0, true, compute);
+    return translate_program(request, 0, true, compute, heap_view);
 }
 
 x2w::NativeComputeShader x2w::translate_graphics_container(const std::string &bytes,bool pixel) {

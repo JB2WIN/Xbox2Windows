@@ -3,6 +3,8 @@
 #include "native_buffer_stride.h"
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <d3d12.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -13,6 +15,9 @@
 // known: the capture keeps {slot, type, stride} for each slot of the heap, and the dispatch is refused, before any
 // shader runs, when the selected slot holds another type than the one the shader reads. No heap-indexed data read is
 // translated here; this header only classifies, serializes and checks.
+//
+// A .views file describes the one dispatch it was captured from. It is not part of the .cdx/.root content key of the
+// request it sits next to.
 namespace x2w_startup {
 enum class GlobalSrvType : unsigned { none, raw_buffer, structured_buffer, typed_buffer, texture };
 
@@ -37,6 +42,7 @@ struct GlobalSrvView {
     unsigned slot = 0;
     GlobalSrvType type = GlobalSrvType::none;
     unsigned stride = 0; // Bytes per element for a buffer view (the value native_view_stride gives), 0 for a texture.
+    std::uint64_t bytes = 0; // Size of the buffer in bytes, 0 for a texture. Set by the caller from the resource description.
 };
 
 // Classifies the description a title passed for an SRV (slot 18 of the device interface). False: not a view this
@@ -69,9 +75,9 @@ struct GlobalSrvRequest {
 
 inline std::string encode_global_srv_request(const GlobalSrvRequest &request) {
     std::ostringstream out;
-    out << "x2w-global-srv-views 1\nselect " << request.selected << "\nneed " << global_srv_type_name(request.needed) << '\n';
+    out << "x2w-global-srv-views 2\nselect " << request.selected << "\nneed " << global_srv_type_name(request.needed) << '\n';
     for (const auto &view : request.views)
-        out << "slot " << view.slot << ' ' << global_srv_type_name(view.type) << ' ' << view.stride << '\n';
+        out << "slot " << view.slot << ' ' << global_srv_type_name(view.type) << ' ' << view.stride << ' ' << view.bytes << '\n';
     return out.str();
 }
 
@@ -80,8 +86,8 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
     request = {};
     std::istringstream in(text);
     std::string line;
-    if (!std::getline(in, line) || line != "x2w-global-srv-views 1") {
-        error = "global SRV view metadata has no 'x2w-global-srv-views 1' header";
+    if (!std::getline(in, line) || line != "x2w-global-srv-views 2") {
+        error = "global SRV view metadata has no 'x2w-global-srv-views 2' header";
         return false;
     }
     bool has_need = false;
@@ -105,7 +111,7 @@ inline bool decode_global_srv_request(const std::string &text, GlobalSrvRequest 
         } else if (key == "slot") {
             GlobalSrvView view;
             std::string name;
-            if (!(fields >> view.slot >> name >> view.stride)) {
+            if (!(fields >> view.slot >> name >> view.stride >> view.bytes)) {
                 error = "global SRV view metadata: unreadable slot line";
                 return false;
             }

@@ -31,6 +31,7 @@ struct NativeComputePipeline {
 
 NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, ShaderDxilCompiler &compiler,
                                                      const std::filesystem::path &marker, unsigned entry,
-                                                     const std::filesystem::path &cache, bool direct_dxil = false);
+                                                     const std::filesystem::path &cache, bool direct_dxil = false,
+                                                     HeapViewContract heap_view = HeapViewContract::none);
 
 } // namespace x2w

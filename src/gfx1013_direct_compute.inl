@@ -8,6 +8,8 @@ struct DirectCompute {
     unsigned exchange_words = 0;
     bool uses_exchange = false;
     bool wave64 = false;
+    // The view class a GPU-selected heap slot is read as; see HeapViewContract.
+    HeapViewContract heap_view = HeapViewContract::none;
     std::vector<bool> scc_live;
     unsigned label_number = 0;
     bool pixel_stage = false;
@@ -247,11 +249,19 @@ struct DirectCompute {
             }
         }
     }
+    // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer is the only class that is translated.
+    void refuse_heap_contract(unsigned pc) const {
+        if (heap_view == HeapViewContract::none)
+            refuse(pc, "direct resource-heap load requires the selected GPU slot and its view type");
+        if (heap_view == HeapViewContract::other)
+            refuse(pc, "GPU-selected heap slot view type is not raw_buffer; only raw buffer heap reads are translated");
+    }
     // A raw buffer SRV chosen by a GPU value in the whole descriptor heap: ResourceDescriptorHeap[slot]. The view class the
     // shader reads is the one this handle is annotated with (raw buffer); a slot holding another class is refused by the
     // dispatch before the shader runs. The binding names the heap (no table register); the pipeline indexes it directly.
     string heap_resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes) {
         const auto &symbol = s.at(base);
+        refuse_heap_contract(i.pc);
         if (kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv)
             refuse(i.pc, "a GPU-selected heap slot is read as a raw buffer SRV only");
         if (symbol.offset % 32 || s[base].type != Symbol::Type::indexed_descriptor)
@@ -270,7 +280,9 @@ struct DirectCompute {
             bindings.push_back({ComputeViewKind::heap_buffer_srv, compute_resource_heap, 0, 0, bytes});
         else
             it->required_bytes = (std::max)(it->required_bytes, bytes);
-        ir.features |= 16;
+        // 16: raw buffers. 0x40000000: the module reads ResourceDescriptorHeap (DXC sets both for the HLSL reference,
+        // see tests/native_heap_handle_probe_check.py); the validator refuses a module whose flags do not match.
+        ir.features |= 16 | 0x40000000;
         return ir.heap_handle(ir.binary("add", read(base), to_string(symbol.offset / 32)), 11, 0);
     }
     string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
@@ -388,9 +400,21 @@ struct DirectCompute {
             unsigned so = i.b >> 25;
             const auto &low = s.at(i.src[0]);
             const bool root = low.type == Symbol::Type::root_address;
+            if (!root && low.type == Symbol::Type::table && low.value == compute_resource_heap) {
+                // Reads from the whole descriptor heap: only the indexed descriptor load of a captured raw buffer slot.
+                if (i.op >= 8)
+                    refuse(i.pc, "scalar buffer load from the descriptor heap is not translated");
+                refuse_heap_contract(i.pc);
+                if (so == 125)
+                    refuse(i.pc, "heap descriptor load needs a GPU-selected index (SGPR offset)");
+                // The captured selection names the slot the GPU data selects; a constant index or an immediate offset
+                // would address another slot than the one the guard checked.
+                if (s.at(so).type == Symbol::Type::constant)
+                    refuse(i.pc, "heap descriptor index is a constant; the captured selection must come from GPU data");
+                if (i.b & 0xfffff)
+                    refuse(i.pc, "heap descriptor load with an immediate offset addresses another slot than the captured selection");
+            }
             if (i.op < 8 && !root) {
-                if (low.type == Symbol::Type::table && low.value == compute_resource_heap)
-                    refuse(i.pc, "direct resource-heap load requires the selected GPU slot and its view type");
                 if (s.at(i.src[0]).type != Symbol::Type::table ||
                     s.at(i.src[0] + 1).type != Symbol::Type::constant || s.at(i.src[0] + 1).value != 0)
                     refuse(i.pc, "direct descriptor address outside bound table");
@@ -1428,22 +1452,10 @@ struct DirectCompute {
             const auto field = source(i, i.src[1], state);
             if (descriptor.type == Symbol::Type::indexed_descriptor && descriptor.value == compute_resource_heap &&
                 descriptor.offset % 32 == 4 && field.type == Symbol::Type::constant && field.value == 0xe0010) {
-                auto &bindings = analysis.result.bindings;
-                auto it = std::find_if(bindings.begin(), bindings.end(), [](const auto &binding) {
-                    return binding.kind == ComputeViewKind::heap_stride_srv;
-                });
-                if (it == bindings.end()) {
-                    bindings.push_back({ComputeViewKind::heap_stride_srv, compute_resource_heap, 0, analysis.srv++, 4});
-                    it = std::prev(bindings.end());
-                }
-                ir.features |= 16;
-                auto handle = ir.handle({0, it->shader_register, 11, 0, 0, 0});
-                auto slot = ir.binary("add", read(i.src[0]), to_string(descriptor.offset / 32));
-                auto bytes = load_buffer(handle, ir.binary("shl", slot, "2"), true, 1);
-                auto stride = ir.binary("and", ir.value("extractvalue %dx.types.ResRet.i32 " + bytes + ", 0"), "16383");
-                write(i.dst, stride);
-                write(128, ir.value("zext i1 " + cmp("ne", stride, "0") + " to i32"));
-                return;
+                // Reachable only through a heap descriptor load, which needs the raw_buffer contract. A raw buffer view
+                // has no stride to read, so the stride of a GPU-selected slot stays untranslated in the direct path.
+                refuse_heap_contract(i.pc);
+                refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }
         }
         auto a = val(0);

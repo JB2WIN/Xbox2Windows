@@ -108,9 +108,14 @@ struct NativeComputeShader {
     bool vertex_fetch = false;
     std::array<unsigned, 8> pixel_writes{};
 };
+// The view class a GPU-selected descriptor heap slot is read as. none: the slot and its view type are not known, so a
+// heap read is refused. raw_buffer: the capture says the selected slot is a raw buffer SRV. other: the capture names a
+// view type that is not translated (refused when the shader reads the heap).
+enum class HeapViewContract : unsigned { none, raw_buffer, other };
 NativeComputeShader translate_compute(const ComputeRequest &request, unsigned entry_byte_offset,
                                       bool direct_dxil = false);
-NativeComputeShader translate_compute_container(ComputeContainer container);
+NativeComputeShader translate_compute_container(ComputeContainer container,
+                                                HeapViewContract heap_view = HeapViewContract::none);
 struct NativeVertexElement {
     std::string semantic;
     unsigned index, format, slot, offset, classification, step_rate;
