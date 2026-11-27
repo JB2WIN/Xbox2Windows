@@ -18,3 +18,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | startup/compute-manifest-retry (compute manifest retry under draw_lock) | PC-Joshua | 2026-11-26 20:39 | local diagnosis, fix in prep |
 | tests/native-wave-request-refusal (cpp-migration wave_request refusal message) | PC-Joshua | 2026-11-26 21:36 | fix in prep |
 | native/global-srv-heap-replay (#2908 capture+replay fixture) | PC-Joshua | 2026-11-26 21:53 | taken over from tedin7 #2912 |
+| native/compute-heap-view-contract (#3023 heap views on in-runtime compute) | PC-Joshua | 2026-11-27 06:16 | design |
