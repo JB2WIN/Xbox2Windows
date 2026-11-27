@@ -326,7 +326,7 @@ def fixed_vertex_draw(work: Path, consumer: Path, sdk: Path, backend: str):
     for rectangle in (False, True):
         env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                    X2W_D3D12_DEBUG="1", X2W_SHADER_CACHE=str(cache), X2W_NATIVE_SHADERS=str(sdk),
-                   X2W_TEST_VERTEX_FETCH="1")
+                   X2W_TEST_VERTEX_FETCH="1", X2W_TEST_FIXED_COLOR="1")
         env.pop("X2W_TEST_FIXED_RECT", None)
         if rectangle:
             env["X2W_TEST_FIXED_RECT"] = "1"
@@ -343,7 +343,7 @@ def fixed_vertex_draw(work: Path, consumer: Path, sdk: Path, backend: str):
         if not rectangle:
             expected.add((3, 3))
         assert (cache/"pixels").read_bytes() == b"".join(
-            bytes((128,)*4) if (x,y) in expected else bytes((0,0,255,255)) for y in range(4) for x in range(8))
+            bytes((64,)*4) if (x,y) in expected else bytes((0,0,255,255)) for y in range(4) for x in range(8))
     return 0
 
 

@@ -550,6 +550,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         corners(positions + 3, {-0.75f, 0.5f, -0.25f, -0.5f});
         corners(texcoords + 9, {-0.25f, -0.5f, 0.0f, -1.0f});
         corners(positions + 9, {-1.0f, 1.0f, -0.75f, -1.0f});
+        // Keep the interpolated fixed-stream color at the center of an RGBA8 quantization bin.
+        if (GetEnvironmentVariableW(L"X2W_TEST_FIXED_COLOR", nullptr, 0))
+            for (auto& vertex : texcoords) vertex[2] = 64.0f / 255.0f;
         static const std::uint16_t indices[6] = {4, 5, 6, 7, 8, 9};
         D3D12_VERTEX_BUFFER_VIEW views[2] = {
             {reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(texcoords), sizeof(texcoords), sizeof(texcoords[0])},
