@@ -33,7 +33,9 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
 
 The issue's reproduction names `native_recording_check` and `native_dispatch_states_warp`, which test
 `x2w_startup::NativeRecording` (descriptor-table pages) and `x2w_startup::NativeDispatchStates` (dispatch barriers). On
-`cpp-migration` only tests use these classes; the D3D12 stand-in does not call the native compiler. The fixture's `record`
+`cpp-migration` only tests use these classes. The D3D12 stand-in translates slot 67 requests natively since #2958
+(opt-in `X2W_NATIVE_SHADERS`) through `translate_compute` without a heap view contract, so a GPU-selected heap read is
+still refused there; passing captured views into that path is follow-up work. The fixture's `record`
 mode records the dispatch with both classes and applies the view guard before `Dispatch`; that is the native recording
 path checked here, and its unchanged UAV sentinels are the "runtime path" sentinels of the issue. The startup runtime
 itself is not covered.

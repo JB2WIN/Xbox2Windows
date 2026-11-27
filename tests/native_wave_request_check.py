@@ -188,13 +188,17 @@ def main(cli, gpu, sdk):
         assert "t0 root=0 bytes=64 min_size=4" in result.stdout and "u0 root=1 bytes=224" in result.stdout
         rejected = write_request(work, [*words[:-1], 0xffffffff, words[-1]], root.read_bytes(), sa)
         result = subprocess.run([*args, rejected, work / "bad.cso"], capture_output=True, text=True)
-        assert result.returncode and "unsupported instruction" in result.stderr and not (work / "bad.cso").exists()
+        # 0xffffffff is not a gfx1013 encoding, so the decoder refuses it before any lowering.
+        assert result.returncode and "unknown gfx1013 instruction format at byte" in result.stderr, result.stderr
+        assert not (work / "bad.cso").exists()
         batch_dir = work / "batch-output"
         batch = subprocess.run([cli, sdk, work / "cache", "--jobs", "2", "gfx1013-compute-wave32@0",
                                 "--requests", work, batch_dir], capture_output=True, text=True)
         assert batch.returncode == 1 and "requests=2 compiled=1 refused=1" in batch.stdout
-        assert (batch_dir / marker.with_suffix(".cso").name).read_bytes() == (work / "good.cso").read_bytes()
-        assert not (batch_dir / rejected.with_suffix(".cso").name).exists()
+        assert (batch_dir / f"{marker.stem[4:]}.cs.cso").read_bytes() == (work / "good.cso").read_bytes()
+        assert (batch_dir / f"{marker.stem[4:]}.txt").is_file()
+        assert not (batch_dir / f"{rejected.stem[4:]}.cs.cso").exists()
+        assert not (batch_dir / f"{rejected.stem[4:]}.txt").exists()
         first = subprocess.run([gpu, sdk, marker, work / "cache"])
         if first.returncode:
             return first.returncode

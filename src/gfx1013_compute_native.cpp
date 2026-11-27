@@ -25,6 +25,10 @@ using std::to_string;
 using Word = uint32_t;
 using Name = std::string_view;
 
+static bool binary16_alu(std::string_view name) {
+    return name == "v_add_f16" || name == "v_sub_f16" || name == "v_subrev_f16" || name == "v_mul_f16";
+}
+
 [[noreturn]] void refuse(unsigned pc, const string &reason) {
     std::ostringstream out;
     out << "native compute +0x" << std::hex << pc << ": " << reason;
@@ -106,6 +110,8 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.enc = Encoding::Sopk;
         i.op = (a >> 23) & 31;
         i.dst = (a >> 16) & 127;
+        // s_setreg_imm32_b32 carries the written value in a literal word.
+        lit = i.op == 0x15;
     } else if ((a >> 30) == 2) {
         i.enc = Encoding::Sop2;
         i.op = (a >> 23) & 127;
@@ -200,6 +206,18 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.enc = Encoding::Mubuf;
         i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
+    } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
+        // FLAT encoding, segment 2 (GLOBAL). Only the one-dword load with an SGPR-pair base (the saddr form,
+        // ADDR = SADDR + zext(VADDR) + sext(OFFSET)) is lowered, as gfx2hlsl.py op_global_load_dword does.
+        // SADDR 125 is `off` on gfx10. LDS, the other segments and opcodes stay refused.
+        i.b = take();
+        i.op = (a >> 18) & 127;
+        const unsigned saddr = (i.b >> 16) & 127;
+        if (((a >> 14) & 3) != 2 || i.op != 12 || (a & 0x2000u) || saddr == 125 || saddr == 127)
+            refuse(pc, "direct global memory supports only global_load_dword with a scalar address pair");
+        i.enc = Encoding::Mubuf;
+        i.name = "global_load_dword";
+        i.dst = i.b >> 24;
     } else if ((a & 0xfc000000u) == 0xd8000000) {
         i.enc = Encoding::Lds;
         i.b = take();
@@ -229,6 +247,14 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
     if (!i.wide && (i.enc == Encoding::Vop1 || i.enc == Encoding::Vop2 || i.enc == Encoding::Vopc)) {
+        // These four binary16 ops are not in the admitted SDWA/DPP sets below.
+        // Name the form before that path reports a generic operand-profile refusal.
+        if (direct && !graphics && binary16_alu(encoded.name)) {
+            if (i.src[0] == 249)
+                refuse(pc, "unsupported " + string(encoded.name) + " SDWA form");
+            if (i.src[0] == 250)
+                refuse(pc, "unsupported " + string(encoded.name) + " DPP form");
+        }
         const bool sdwa_logic = i.enc == Encoding::Vop2 && i.op == 0x1d;
         const bool sdwa_class = i.enc == Encoding::Vopc && i.op == 0x88;
         const bool sdwa_compare = i.enc == Encoding::Vopc && !sdwa_class;
@@ -323,7 +349,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             if (control & (1u << 17)) refuse(pc,"reserved DPP16 control bit");
             const auto pattern = (control >> 8) & 0x1ff;
             i.dpp_control = pattern;
-            if (!i.mirror_mask() && (pattern > 255 || !graphics))
+            if (pattern > 255 && !i.mirror_mask())
                 refuse(pc,"unsupported DPP lane selection");
             i.dpp_fetch_inactive = (control & (1u << 18)) != 0;
             i.dpp_bound_zero = (control & (1u << 19)) != 0;
@@ -352,7 +378,8 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
     if (i.enc == Encoding::Vop1 && !i.op) i.name = "v_nop";
     if (i.name.empty()) {
         const char *name = mnemonic(i.enc,i.op);
-        if(!name && direct && !encoded.name.empty())name=encoded.name.data();
+        if (!name && (direct || encoded.name == "v_readlane_b32") && !encoded.name.empty())
+            name = encoded.name.data();
         if (!name)
             refuse(pc, "unsupported opcode " + hexword(a));
         i.name = name;
@@ -360,7 +387,7 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.dst = 126;
         if (i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32") {
             i.dst -= 256;
-            if (i.dst > 105)
+            if (i.dst > (graphics ? 105u : 107u))
                 refuse(pc, "invalid scalar lane read destination");
         }
     }
@@ -431,7 +458,8 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
     if (i.name == "s_max_u32" && a.type == T::stride && b.value == 1) return field(a, T::byte_stride);
     if (i.name == "s_and_b32" && b.value == 0xc000ffff && component(a,1)) return field(a,T::zero_stride_word);
     if (i.name == "s_and_b32" && b.value == 0xcfffffff && component(a,3)) return field(a,T::clear_oob);
-    if (i.name == "s_or_b32" && b.value == 0x30000000 && a.type == T::clear_oob) return field(a,T::byte_oob);
+    if (i.name == "s_or_b32" && b.value == 0x30000000 && (a.type == T::clear_oob || component(a,3)))
+        return field(a,T::byte_oob);
     return {};
 }
 State transfer(const Inst &i, State s, bool wave64, bool graphics) {
@@ -492,6 +520,16 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics) {
         if (a.type == Symbol::Type::constant && b.type == Symbol::Type::constant)
             out = {Symbol::Type::constant,i.name=="s_and_b32" ? a.value & b.value : a.value << (b.value & 31)};
         set(i.dst, out);
+    } else if (!graphics && i.name == "s_bfm_b64") {
+        auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
+        Symbol lo{}, hi{};
+        if (a.type == Symbol::Type::constant && b.type == a.type) {
+            const auto mask = ((uint64_t{1} << (a.value & 63)) - 1) << (b.value & 63);
+            lo = {a.type, Word(mask)};
+            hi = {a.type, Word(mask >> 32)};
+        }
+        set(i.dst, lo);
+        set(i.dst + 1, hi);
     } else if (i.name == "s_bfm_b32") {
         auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
         Symbol v{};
@@ -698,9 +736,12 @@ struct Emit {
         const bool indexed = sym.type == Symbol::Type::indexed_descriptor;
         if ((!indexed && sym.type != Symbol::Type::descriptor) || base + width > state.size())
             refuse(i.pc, "unproven resource descriptor s" + to_string(base));
+        const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
+                                 (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
+                                  state[base + 1].type == Symbol::Type::zero_stride_word);
         for (unsigned j = 1; j < width; ++j) {
             Symbol expected = sym;
-            if (kind == ComputeViewKind::byte_window_srv) {
+            if (byte_window) {
                 constexpr Symbol::Type fields[] = {Symbol::Type::descriptor, Symbol::Type::zero_stride_word,
                                                    Symbol::Type::byte_count, Symbol::Type::byte_oob};
                 expected.type = fields[j];
@@ -1011,6 +1052,10 @@ struct Emit {
     }
     void vector(const Inst &i) {
         auto n = i.name;
+        if ((n == "v_readfirstlane_b32" || n == "v_readlane_b32") && i.dst >= 106)
+            refuse(i.pc, "invalid scalar lane read destination");
+        if (n == "v_readlane_b32")
+            refuse(i.pc, "unsupported HLSL instruction v_readlane_b32");
         auto selected = [&](unsigned j) {
             require_numeric(i, i.src[j]);
             auto s = operand(i, i.src[j]);
@@ -1377,7 +1422,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         refuse(entry, "invalid compute group shape");
     if (rsrc2 & ~0xff9fbeu || lds > 64)
         refuse(entry, "unsupported compute resource flags");
-    if (threads > 32 && threads % 32)
+    if (!direct_dxil && threads > 32 && threads % 32)
         refuse(entry, "partial final wave in multi-wave group");
     Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> sig;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
@@ -1466,6 +1511,12 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
+        if (threads % (wave64 ? 64 : 32))
+            for (const auto &i : program.code)
+                if (i.name == "v_readlane_b32" || i.name == "v_writelane_b32")
+                    DirectCompute::validate_lane_shape(i, static_cast<unsigned>(threads), wave64 ? 64 : 32);
+        if (threads > 32 && threads % 32)
+            refuse(entry, "partial final wave in multi-wave group");
         if (wave64 && threads % 64) refuse(entry, "wave64 exchange requires complete guest waves");
         if (wave64 && threads > 64) {
             const auto &code = program.code;
@@ -1473,7 +1524,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
                 [](const Inst &i) { return i.branch() && i.op != 2; });
             const bool synchronizes = std::any_of(code.begin(), code.end(), [](const Inst &i) {
                 return i.enc == Encoding::Vopc || i.enc == Encoding::Lds || carry_destination(i) ||
-                       i.name == "v_readfirstlane_b32" || i.name == "s_barrier";
+                       i.name == "v_readfirstlane_b32" || i.name == "v_readlane_b32" || i.name == "s_barrier";
             });
             if (branches && synchronizes) refuse(entry, "multi-wave64 exchange requires converged group control flow");
         }
@@ -1497,6 +1548,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
                     refuse(entry, "compute root descriptor type or visibility");
             }
         }
+        translated.group = {x, y, z};
         return translated;
     }
     lower_blocks(emit);
@@ -1579,6 +1631,7 @@ uint fpClass(uint v){
     h << emit.body.str() << "}\n";
     emit.result.hlsl = h.str();
     emit.result.instruction_count = static_cast<unsigned>(program.code.size());
+    emit.result.group = {x, y, z};
     return std::move(emit.result);
 }
 
@@ -1673,15 +1726,15 @@ x2w::DirectGraphicsPair x2w::translate_graphics_pair(std::string_view a,std::str
 // Fixed-descriptor draws publish the bounded native stages in export order,
 // without FSSM signatures. Link PARAM exports to interpolator reads using
 // the captured entry layout and the channels actually named by each stage.
-static bool raw_center_inputs(unsigned mask, unsigned count) {
+static bool raw_center_inputs(unsigned enable_mask) {
     // SPI_PS_INPUT_ADDR allocates the enabled X/Y/Z/W components after
     // the center I/J pair. The packed screen coordinate is a later VGPR.
     // victory-shader 9376fd6 io.rs::PS_VGPRS uses the same allocation.
     constexpr unsigned position_inputs = (0xfu << 8) | (1u << 15);
-    return (mask & ~position_inputs) == 2 && count > 0 && count <= 7;
+    return (enable_mask & ~position_inputs) == 2;
 }
 static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_ROOT_SIGNATURE_DESC1 &layout,
-                                         unsigned address_mask, unsigned interpolants) {
+                                         unsigned enable_mask, unsigned address_mask) {
     if (bytes.empty() || bytes.size() % 4 || bytes.size() > (1u << 20))
         throw UnsupportedComputeShader("invalid raw graphics extent");
     GuestShaderStage stage{};
@@ -1689,7 +1742,7 @@ static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_RO
     bool position = false, color = false, ended = false;
     struct Parameter { unsigned exported = 0, smooth = 0, flat = 0; };
     std::array<Parameter, 7> params{};
-    const bool has_params = raw_center_inputs(address_mask, interpolants);
+    const bool has_params = raw_center_inputs(enable_mask);
     std::map<unsigned, unsigned> visited;
     std::deque<unsigned> pending{0};
     while (!pending.empty()) {
@@ -1711,7 +1764,7 @@ static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_RO
         if (op.form == gfx1013::Form::vintrp) {
             Word w; std::memcpy(&w, bytes.data()+pc, sizeof(w));
             const unsigned attr = (w >> 10) & 63;
-            if (attr >= interpolants) refuse(pc, "raw interpolation attribute exceeds entry count");
+            if (attr >= params.size()) refuse(pc, "raw interpolation attribute exceeds entry count");
             auto &mask = ((w >> 16) & 3) == 2 ? params[attr].flat : params[attr].smooth;
             mask |= 1u << ((w >> 8) & 3);
         }
@@ -1740,8 +1793,11 @@ static GuestShaderStage read_raw_graphics(std::string_view bytes, const D3D12_RO
     stage.stage = position ? GpuStage::vs : GpuStage::ps;
     stage.fixed_vertex_abi = position && has_params;
     stage.code.assign(bytes.substr(0,extent));
-    if (color) stage.pixel_input_address = address_mask;
-    if ((color && (address_mask & 0x8f00)) || (position && has_params))
+    if (color) {
+        stage.pixel_input_address = address_mask;
+        stage.pixel_input_enable = enable_mask;
+    }
+    if ((color && (enable_mask & 0x8f00)) || (position && has_params))
         (color ? stage.input_signature : stage.output_signature).push_back({"SV_Position",0,1,3,0,15,15});
     for (uint8_t attr = 0; attr < params.size(); ++attr) {
         const auto &p = params[attr];
@@ -1777,17 +1833,17 @@ x2w::DirectGraphicsPair x2w::translate_graphics_pair(std::string_view a,std::str
                                                      const D3D12_ROOT_SIGNATURE_DESC1 &layout, std::string_view pixel_entry,
                                                      std::optional<GpuStage> first_stage) {
     const bool raw = a.substr(0,4)!="DXBC" && b.substr(0,4)!="DXBC";
-    unsigned mask=0, count=0;
+    unsigned enable_mask=0, address_mask=0;
     if (!pixel_entry.empty()) {
-        if (!raw || pixel_entry.size()!=12 || pixel_entry.substr(0,4)!="PSI1")
+        if (!raw || pixel_entry.size()!=13 || pixel_entry.substr(0,5)!="psin1")
             refuse(0,"invalid raw pixel entry record");
-        std::memcpy(&mask,pixel_entry.data()+4,4);
-        std::memcpy(&count,pixel_entry.data()+8,4);
-        if (!((mask==0x8080 && count==0) || raw_center_inputs(mask,count)))
-            mask=count=0;
+        std::memcpy(&enable_mask,pixel_entry.data()+5,4);
+        std::memcpy(&address_mask,pixel_entry.data()+9,4);
+        if (enable_mask > 0xffff || address_mask > 0xffff || (enable_mask & ~address_mask))
+            refuse(0,"contradictory pixel input enable/address masks");
     }
     auto read_stage = [&](std::string_view bytes) {
-        return raw ? std::vector<GuestShaderStage>{read_raw_graphics(bytes,layout,mask,count)} : read_guest_shader_container(bytes);
+        return raw ? std::vector<GuestShaderStage>{read_raw_graphics(bytes,layout,enable_mask,address_mask)} : read_guest_shader_container(bytes);
     };
     auto left=read_stage(a),right=read_stage(b);
     if(left.size()!=1 || right.size()!=1)refuse(0,"expected a distinct stage per graphics container");

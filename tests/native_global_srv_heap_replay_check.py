@@ -133,7 +133,8 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     def compile_directory(directory):
         out_dir = base / (directory.name + "_out")
         result = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
-        return result, out_dir / (stem + ".cso")
+        # compile_dxil --requests publishes <key>.cs.cso (the req_ prefix stripped) for a compute request.
+        return result, out_dir / (stem[len("req_"):] + ".cs.cso")
 
     selections = [request_dir(f"sel{n}") for n in range(4)]
     nometa = request_dir("nometa")
@@ -205,7 +206,7 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         views.write_text(text, newline="\n")
         (code, out, err), cso = compile_directory(directory)
         require(code == 1 and expected in err, f"compile_dxil '{name}': refused with '{expected}'")
-        require(not cso.exists(), f"compile_dxil '{name}': no .cso")
+        require(not cso.exists() and not any(cso.parent.glob("*.cso")), f"compile_dxil '{name}': no .cso")
         code, out, err = replay(selections[0], outputs[0], views, "refused", 0)
         require(code == 0 and expected in out and "sentinels intact" in out,
                 f"replay '{name}': refused with the same diagnostic, u0 sentinels intact")
@@ -249,7 +250,7 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         out_dir = base / (directory.name + "_out")
         code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
         require(code == 1 and expected in err, f"compile_dxil shape '{name}': refused with '{expected}'")
-        require(not (out_dir / (shape_stem + ".cso")).exists(), f"compile_dxil shape '{name}': no .cso")
+        require(not any(out_dir.glob("*.cso")), f"compile_dxil shape '{name}': no .cso")
 
     missing = base / "missing" / (stem + ".views")
     code, out, err = replay(selections[0], outputs[0], missing, "refused", 0)
