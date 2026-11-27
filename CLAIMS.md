@@ -22,3 +22,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | native/heap-mixed-raw-typed (#3023 mixed raw+typed heap reads) | PC-Joshua | 2026-11-27 11:04 | design round 1 |
 | native/heap-mixed-raw-typed (#3023 mixed raw+typed heap contract) | PC-Joshua | 2026-11-27 12:32 | design review |
 | native/sampler-heap-fixed-index (#2935 samplers: fixed-index sampler heap reads) | PC-Joshua | 2026-11-27 14:17 | design |
+| shader/raw-load-scalar-offset (direct raw buffer loads: off addressing and SGPR offset) | PC-Joshua | 2026-11-27 18:17 | starting |
