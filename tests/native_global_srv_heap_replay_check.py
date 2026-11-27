@@ -253,6 +253,8 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
     WINDOW = window()
     second_load = window([0xbe980320 if w == 0xbe980314 else w for w in rewrite])
     second_load[after_wait - 1:after_wait - 1] = [0xf4080801, 0x22000000]  # before the s_waitcnt
+    # The branch word sits at after_wait + 1; its target is next pc + 4 * simm16, here the s_lshl_b32 at word lshl.
+    loop_around_load = window(prefix=(0xbf071010, 0xbf850000 | ((lshl - (after_wait + 2)) & 0xFFFF)))
     shapes = {
         # s_mov_b32 s17, 64 instead of the GPU-derived s_lshl_b32 s17, s16, 5
         "constant_index": (words_list[:lshl] + [0xbe9103c0] + words_list[lshl + 1:],
@@ -270,8 +272,9 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         "window_second_load": (second_load, "non-contiguous resource descriptor"),
         # buffer_store_dword v2, v1, s[24:27], 0 offen: a store through the window
         "window_store": (window(store_word=0x80060201), "a GPU-selected heap slot is read as a raw buffer SRV only"),
-        # s_cmp_lg_u32 s16, s16 and s_cbranch_scc1 -2 (back to the compare, never taken) before the rewrite
-        "window_loop": (window(prefix=(0xbf071010, 0xbf85fffe)), "heap byte window in a program with a backward branch"),
+        # s_cmp_lg_u32 s16, s16 and s_cbranch_scc1 back to the s_lshl_b32 before the heap load (never taken): the
+        # loop contains the heap load, which would run again for another selection
+        "window_loop": (loop_around_load, "heap byte window loaded inside a loop"),
     }
     for name, (program, expected) in shapes.items():
         directory = base / ("shape_" + name)
@@ -298,13 +301,21 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         (directory / (window_stem + ".root")).write_bytes(root)
         return directory, window_stem
 
-    directory, window_stem = window_request("stride_unused", words_list[:after_wait] + [0x9398ff15, 0x000e0010] +
-                                            words_list[after_wait:])
-    (directory / (window_stem + ".views")).write_text(good, newline="\n")
-    out_dir = base / "stride_unused_out"
-    code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
-    require(code == 0 and "requests=1 compiled=1 refused=0" in out and (out_dir / (window_stem[len("req_"):] + ".cs.cso")).exists(),
-            "compile_dxil: an unused stride read compiles and publishes a .cso")
+    compiled_shapes = {
+        "stride_unused": (words_list[:after_wait] + [0x9398ff15, 0x000e0010] + words_list[after_wait:],
+                          "an unused stride read compiles and publishes a .cso"),
+        # s_cmp_lg_u32 s16, s16 and s_cbranch_scc1 -2 (back to the compare, never taken) after the heap load: the loop
+        # does not contain the load, which runs once
+        "window_loop_after_load": (window(prefix=(0xbf071010, 0xbf85fffe)),
+                                   "a loop after the heap load does not refuse the window, a .cso is published"),
+    }
+    for name, (program, message) in compiled_shapes.items():
+        directory, window_stem = window_request(name, program)
+        (directory / (window_stem + ".views")).write_text(good, newline="\n")
+        out_dir = base / (name + "_out")
+        code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
+        require(code == 0 and "requests=1 compiled=1 refused=0" in out and
+                (out_dir / (window_stem[len("req_"):] + ".cs.cso")).exists(), "compile_dxil: " + message)
     window_outputs = {}
     for n in (0, 1):
         directory, window_stem = window_request(f"window{n}", WINDOW)

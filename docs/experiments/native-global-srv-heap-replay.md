@@ -16,8 +16,9 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
   `byte_descriptor_field` already models for table descriptors (`s_bfe_u32 ... 0xe0010` stride, `s_max_u32 ... 1`,
   `s_mul_i32` byte count, `s_and_b32 ... 0xc000ffff`, `s_and_b32 ... 0xcfffffff`, `s_or_b32 ... 0x30000000`, word 0
   copied). A raw load through the rewritten descriptor reads the same `ResourceDescriptorHeap[slot]` raw view. The words
-  must all come from one heap load (same pc); a program with a backward branch anywhere refuses the window, as a
-  precaution, because a loop would run that load again for another selection. The caller's contract: every slot the
+  must all come from one heap load (same pc). As a precaution, a backward branch whose loop contains that heap load
+  refuses the window, because the loop would run the load again for another selection. Loops elsewhere in the program
+  do not refuse it. The caller's contract: every slot the
   program can select is a raw view of exactly `num_records * max(stride, 1)` bytes; the translator does not check that,
   nor the swizzle bits or the other word 3 fields. Without the contract the first refusal stays as before.
 - Modules that read `ResourceDescriptorHeap` now also set shader flag `0x40000000`, as DXC does for the HLSL reference.
@@ -82,9 +83,10 @@ The check runs, in order:
    an immediate offset, a stride read used as a number (`unbound numeric SGPR s24`), and four byte-address rewrites the
    raw slot view cannot stand for: a wrong stride mask (`unbound numeric SGPR s21`), word 0 from a second heap load
    (`non-contiguous resource descriptor`), a store through the rewritten descriptor (`a GPU-selected heap slot is read
-   as a raw buffer SRV only`) and a never-taken backward branch before the rewrite (`heap byte window in a program with
-   a backward branch`).
-9. The byte-address rewrite: a stride read that nothing uses compiles; the program with the full rewrite is recorded
+   as a raw buffer SRV only`) and a never-taken backward branch to (or before) the heap load (`heap byte window loaded
+   inside a loop`).
+9. The byte-address rewrite: a stride read that nothing uses compiles, a never-taken backward branch after the heap
+   load (the loop does not contain the load) compiles, and the program with the full rewrite is recorded
    for selections 0 and 1 (output equals the slot's data), compiled by `compile_dxil --requests`, replayed with the
    same result, and replaying selection 0 against the slot 1 reference reports a mismatch.
 
@@ -112,6 +114,12 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   "native_|startup_compute_dispatch|compute_heap" -j 6`: 147 tests, 142 passed, 4 skipped (77, WARP), 1 failed
   (`native_cvt_pk_u8_hardware`, failing before the change as well). `compile_dxil --refusals` on a local start-up
   capture gives the same output as before (it translates without a contract).
+- Loop guard narrowed: the first version of the guard refused the window for any backward branch in the program.
+  With the contract forced locally (an uncommitted switch), it refused 921 of the 2,689 requests of the same capture.
+  With the guard limited to loops around the heap load, none of these is refused for a loop; 906 then stop at a typed
+  load (`buffer_load_format_*`) through the heap descriptor. After the change, the test passes with 84 assertions. The
+  run against the earlier commit `7582c01d` fails at the `window_loop` shape (old text "heap byte window in a program
+  with a backward branch"). The run stops there.
 
 ## Limits
 

@@ -291,12 +291,13 @@ struct DirectCompute {
             refuse(i.pc, "a GPU-selected heap slot is read as a raw buffer SRV only");
         if (symbol.offset % 32 || s[base].type != Symbol::Type::indexed_descriptor)
             refuse(i.pc, "unaligned heap descriptor");
-        // Precaution: the rewritten words are compared by the pc of their heap load, which a loop executes again for
-        // another selection.
+        // Precaution: the rewritten words are compared by the pc of their heap load (symbol.definition), which a loop
+        // around that load executes again for another selection. A loop that does not contain the load runs it once.
+        // The scan also sees unreached code up to s_endpgm, which can only refuse more.
         if (window)
             for (const auto &inst : analysis.program.code)
-                if (inst.branch() && inst.target() <= inst.pc)
-                    refuse(i.pc, "heap byte window in a program with a backward branch");
+                if (inst.branch() && inst.target() <= symbol.definition && symbol.definition <= inst.pc)
+                    refuse(i.pc, "heap byte window loaded inside a loop");
         constexpr Symbol::Type window_words[] = {Symbol::Type::indexed_descriptor, Symbol::Type::zero_stride_word,
                                                  Symbol::Type::byte_count, Symbol::Type::byte_oob};
         for (unsigned j = 1; j < 4; ++j) {
