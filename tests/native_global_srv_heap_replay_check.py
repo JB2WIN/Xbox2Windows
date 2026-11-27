@@ -377,9 +377,9 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         (directory / (typed_stem + ".root")).write_bytes(root)
         return directory, typed_stem
 
-    def typed_compile(directory, typed_stem, out_name):
+    def typed_compile(directory, typed_stem, out_name, cache_dir=cache):
         out_dir = base / out_name
-        code, out, err = run([compile_dxil, sdk, cache, "gfx1013-container-cs", "--requests", directory, out_dir])
+        code, out, err = run([compile_dxil, sdk, cache_dir, "gfx1013-container-cs", "--requests", directory, out_dir])
         return code, out, err, out_dir / (typed_stem[len("req_"):] + ".cs.cso")
 
     typed_selection = {}
@@ -440,5 +440,141 @@ with tempfile.TemporaryDirectory(prefix="x2w_global_srv_") as scratch:
         code, out, err, cso = typed_compile(directory, typed_stem, "neg_" + name + "_out")
         require(code == 1 and expected in err, f"compile_dxil '{name}': refused with '{expected}'")
         require(not any(cso.parent.glob("*.cso")), f"compile_dxil '{name}': no .cso")
+
+    # 11. Mixed raw and typed heap reads (HeapViewContract::raw_and_typed_dword): MIXED reads word 0 of the selector
+    #     buffer as a raw slot (buffer_load_dword) and word 1 as a typed slot (buffer_load_format_x) and stores the
+    #     sum, so u0 equals slot a + slot 3. The capture lists selection 0 as select/need and selection 1 as `also`.
+    #     Assembled with LLVM 15 as above; the first selector word feeds the raw load, the second the typed load.
+    MIXED = [
+        0xbe810380,  # s_mov_b32 s1, 0
+        0xbe830380,  # s_mov_b32 s3, 0
+        0xf4080200, 0xfa000000,  # s_load_dwordx4 s[8:11], s[0:1], 0x0        (t0: the two selector words)
+        0xf4080300, 0xfa000020,  # s_load_dwordx4 s[12:15], s[0:1], 0x20      (u0)
+        0xf4240404, 0xfa000000,  # s_buffer_load_dwordx2 s[16:17], s[8:11], 0x0  (word 0 raw slot, word 1 typed slot)
+        0xbf8cc07f,  # s_waitcnt lgkmcnt(0)
+        0x8f128510,  # s_lshl_b32 s18, s16, 5
+        0x8f138511,  # s_lshl_b32 s19, s17, 5
+        0xf4080501, 0x24000000,  # s_load_dwordx4 s[20:23], s[2:3], s18       (heap descriptor, raw slot)
+        0xf4080601, 0x26000000,  # s_load_dwordx4 s[24:27], s[2:3], s19       (heap descriptor, typed slot)
+        0xbf8cc07f,  # s_waitcnt lgkmcnt(0)
+        0x34020082,  # v_lshlrev_b32_e32 v1, 2, v0
+        0xe0301000, 0x80050201,  # buffer_load_dword v2, v1, s[20:23], 0 offen
+        0xe0002000, 0x80060300,  # buffer_load_format_x v3, v0, s[24:27], 0 idxen
+        0xbf8c3f70,  # s_waitcnt vmcnt(0)
+        0x4a040702,  # v_add_nc_u32_e32 v2, v2, v3
+        0xe0701000, 0x80030201,  # buffer_store_dword v2, v1, s[12:15], 0 offen
+        0xbf810000,  # s_endpgm
+    ]
+    MIXED_OK = "output matches slot {a}+3 data"
+    # Its own frontend cache, so that the first compile of each program here translates.
+    cache11 = base / "cache11"
+    cache11.mkdir()
+
+    mixed = {}
+    for a in (0, 1):
+        directory, mixed_stem = typed_dir(f"mixed{a}", MIXED)
+        code, out, err = run([fixture, "record", sdk, cache, directory / (mixed_stem + ".cdx"), adapter, a, "ok",
+                              "--need", "raw_buffer", "--also", 3, "typed_buffer"])
+        require(code == 0 and MIXED_OK.format(a=a) in out,
+                f"record mixed select {a}+3: u0 equals the sum of the slot {a} and slot 3 data")
+        text = (directory / (mixed_stem + ".views")).read_text()
+        require(text.startswith("x2w-global-srv-views 2\nselect %d\nneed raw_buffer\nalso 3 typed_buffer\n" % a) and
+                "dword 3 1\n" in text, f"record mixed select {a}+3 captured both selections and the slot 3 channel count")
+        mixed[a] = (directory, mixed_stem)
+    MV = (mixed[0][0] / (mixed[0][1] + ".views")).read_text()
+
+    mixed_cso = {}
+    for a in (0, 1):
+        directory, mixed_stem = mixed[a]
+        code, out, err, cso = typed_compile(directory, mixed_stem, f"mixed{a}_out", cache_dir=cache11)
+        require(code == 0 and "requests=1 compiled=1 refused=0" in out and cso.exists(),
+                f"compile_dxil mixed select {a}+3: compiled and published a .cso")
+        require(f"global_srv select={a} need=raw_buffer also=3:typed_buffer" in out,
+                f"compile_dxil mixed select {a}+3: reports both selections")
+        if a == 0:
+            require("frontend_cache_hit=0" in out, "compile_dxil mixed select 0+3: translated (fresh frontend cache)")
+        mixed_cso[a] = cso
+    directory, mixed_stem = mixed[0]
+    code, out, err, again = typed_compile(directory, mixed_stem, "mixed0_again", cache_dir=cache11)
+    require(code == 0 and "frontend_cache_hit=1" in out and again.read_bytes() == mixed_cso[0].read_bytes(),
+            "compile_dxil mixed select 0+3 again: frontend cache hit, same .cso")
+
+    for a in (0, 1):
+        directory, mixed_stem = mixed[a]
+        code, out, err = run([fixture, "replay", sdk, cache, directory / (mixed_stem + ".cdx"), mixed_cso[a],
+                              directory / (mixed_stem + ".views"), adapter, "ok", f"{a}+3"])
+        require(code == 0 and MIXED_OK.format(a=a) in out, f"replay mixed select {a}+3: output equals the sum of the slot data")
+    directory, mixed_stem = mixed[0]
+    code, out, err = run([fixture, "replay", sdk, cache, directory / (mixed_stem + ".cdx"), mixed_cso[0],
+                          directory / (mixed_stem + ".views"), adapter, "ok", "1+3"])
+    require(code == 1 and "mismatch word 0" in out, "replay mixed select 0+3 compared with slots 1+3 reports a mismatch")
+
+    # Replay refusals: edited metadata, same compiled shader, nothing dispatched.
+    mixed_replay_refusals = {
+        "also_raw": ("also 3 typed_buffer", "also 3 raw_buffer", RAW.format(n=3, t="typed_buffer")),
+        "also_unknown": ("also 3 typed_buffer", "also 9 typed_buffer", "global SRV slot 9 has no captured view type"),
+        "also_texture": ("also 3 typed_buffer", "also 2 texture",
+                         "GPU-selected heap slot view type texture is not raw_buffer or typed_buffer"),
+    }
+    for name, (old, new, expected) in mixed_replay_refusals.items():
+        require(old in MV, f"mixed replay refusal '{name}' edits an existing line")
+        edited = base / f"mixed_{name}.views"
+        edited.write_text(MV.replace(old, new), newline="\n")
+        code, out, err = run([fixture, "replay", sdk, cache, directory / (mixed_stem + ".cdx"), mixed_cso[0], edited,
+                              adapter, "refused", "0+3"])
+        require(code == 0 and expected in out and "no dispatch submitted" in out and "sentinels intact" in out,
+                f"replay mixed '{name}': refused with '{expected}', nothing dispatched")
+
+    # The second selection names a raw slot that the shader's typed view cannot stand for: refused before the dispatch.
+    directory, mixed_stem = typed_dir("mixed_refused", MIXED)
+    code, out, err = run([fixture, "record", sdk, cache, directory / (mixed_stem + ".cdx"), adapter, 0, "refused",
+                          "--need", "raw_buffer", "--also", 1, "typed_buffer"])
+    require(code == 0 and TYPED_RAW.format(n=1, t="raw_buffer") in out and "no dispatch submitted" in out and
+            "sentinels intact" in out, "record mixed select 0+1 as typed: refused before the dispatch")
+
+    # compile_dxil negatives, no .cso. The first two are the translator-level controls: the same program under a
+    # contract that is not the mixed one.
+    typed_xy = typed_program((0xe0042000, 0x80050200))  # buffer_load_format_xy v[2:3], v0, s[20:23], 0 idxen
+    mixed_negatives = {
+        "mixed_raw_views": (MIXED, good, "a GPU-selected heap slot is read as a raw buffer SRV only"),
+        "mixed_typed_views": (MIXED, typed_views, TYPED_ONLY),
+        "mixed_texture": (MIXED, MV.replace("also 3 typed_buffer", "also 2 texture"),
+                          "GPU-selected heap slot view type texture is not raw_buffer or typed_buffer"),
+        "mixed_wrong_type": (MIXED, MV.replace("also 3 typed_buffer", "also 3 raw_buffer"), RAW.format(n=3, t="typed_buffer")),
+        "mixed_unknown_slot": (MIXED, MV.replace("also 3 typed_buffer", "also 9 typed_buffer"),
+                               "global SRV slot 9 has no captured view type"),
+        "mixed_unreadable": (MIXED, MV.replace("also 3 typed_buffer", "also x y"),
+                             "global SRV view metadata: unreadable also line"),
+        "mixed_duplicate": (MIXED, MV.replace("also 3 typed_buffer", "also 0 typed_buffer"),
+                            "global SRV view metadata: duplicate selected slot 0"),
+        "mixed_no_dword": (MIXED, MV.replace("dword 3 1\n", ""),
+                           "GPU-selected heap slot 3 is not a one-channel 32-bit typed buffer (no 32-bit channel metadata)"),
+        "mixed_typed_xy": (typed_xy, MV, "typed heap load reads one channel only"),
+    }
+    for name, (program, views_text, expected) in mixed_negatives.items():
+        require(views_text != MV or name == "mixed_typed_xy", f"mixed negative '{name}' changes the metadata")
+        directory, mixed_stem = typed_dir("neg_" + name, program)
+        (directory / (mixed_stem + ".views")).write_text(views_text, newline="\n")
+        code, out, err, cso = typed_compile(directory, mixed_stem, "neg_" + name + "_out", cache_dir=cache11)
+        require(code == 1 and expected in err, f"compile_dxil '{name}': refused with '{expected}'")
+        require(not any(cso.parent.glob("*.cso")), f"compile_dxil '{name}': no .cso")
+
+    # compile_dxil positives, compile only: a second `also`, and the raw-path programs under the mixed contract (byte
+    # windows by the rewrite, a formatted tbuffer load through a plain or rewritten heap descriptor).
+    mixed_positives = {
+        "mixed_two_also": (MIXED, MV + "also 1 raw_buffer\n"),
+        "mixed_window": (WINDOW, MV),
+        "mixed_twindow": (TWINDOW, MV),
+        # tbuffer_load_format_x v2, v1, s[20:23], 0 format:[BUF_FMT_32_UINT] offen: refused under typed_dword
+        "mixed_tbuffer": (typed_program((0xe8a01000, 0x80050201)), MV),
+    }
+    for name, (program, views_text) in mixed_positives.items():
+        directory, mixed_stem = typed_dir("pos_" + name, program)
+        (directory / (mixed_stem + ".views")).write_text(views_text, newline="\n")
+        code, out, err, cso = typed_compile(directory, mixed_stem, "pos_" + name + "_out", cache_dir=cache11)
+        require(code == 0 and "requests=1 compiled=1 refused=0" in out and cso.exists(),
+                f"compile_dxil '{name}': compiled under the mixed contract")
+        if name == "mixed_two_also":
+            require("also=3:typed_buffer also=1:raw_buffer" in out, "compile_dxil 'mixed_two_also': reports both also entries")
 
 print("native_global_srv_heap_replay: all checks passed")
