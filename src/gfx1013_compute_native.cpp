@@ -764,6 +764,8 @@ struct Emit {
         const bool indexed = sym.type == Symbol::Type::indexed_descriptor;
         if ((!indexed && sym.type != Symbol::Type::descriptor) || base + width > state.size())
             refuse(i.pc, "unproven resource descriptor s" + to_string(base));
+        if (sym.value == compute_sampler_heap)
+            refuse(i.pc, "a sampler heap descriptor is read as a resource");
         const bool byte_window = kind == ComputeViewKind::byte_window_srv ||
                                  (kind == ComputeViewKind::raw_buffer_uav && width == 4 && i.name == "buffer_store_raw" &&
                                   state[base + 1].type == Symbol::Type::zero_stride_word);
@@ -844,15 +846,44 @@ struct Emit {
         it->required_bytes = (std::max)(it->required_bytes, bytes);
         return (write ? "w" : "r") + to_string(it->shader_register);
     }
-    unsigned sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
-                           bool implicit_sample = false, bool comparison = false) {
+    // heap: the sampler is entry `index` of the directly indexed sampler heap. Otherwise `index` is the static sampler register.
+    struct SamplerRef {
+        bool heap;
+        unsigned index;
+    };
+    SamplerRef sampler_index(const Inst &i, const State &state, bool lod, bool gather_base_level = false,
+                             bool implicit_sample = false, bool comparison = false) {
         const unsigned base = ((i.b >> 21) & 31) * 4;
         ComputeSampler sampler{{}, lod, comparison};
+        unsigned literal = 0, heap = 0;
+        const auto &first = state.at(base);
         for (unsigned j = 0; j < 4; ++j) {
             const auto &s = state.at(base + j);
-            if (s.type != Symbol::Type::constant)
-                refuse(i.pc, "nonconstant sampler");
-            sampler.words[j] = s.value;
+            literal += s.type == Symbol::Type::constant;
+            // The heap content is fixed within a dispatch, so contiguity of the four words of one 16-byte entry is enough.
+            heap += s.type == Symbol::Type::descriptor && s.value == compute_sampler_heap && !s.definition &&
+                    first.offset % 16 == 0 && s.offset == first.offset + 4 * j;
+            if (s.type == Symbol::Type::constant)
+                sampler.words[j] = s.value;
+        }
+        if (literal != 4 && heap != 4)
+            refuse(i.pc, "nonconstant sampler");
+        if (heap == 4) {
+            if (gather_base_level)
+                refuse(i.pc, "gather through the sampler heap is not translated");
+            if (comparison)
+                refuse(i.pc, "comparison sampler from the sampler heap is not translated");
+            if (implicit_sample)
+                refuse(i.pc, "sampler from the sampler heap needs image_sample_l or image_sample_lz");
+            const unsigned entry = first.offset / 16, bytes = 16 * (entry + 1);
+            auto &list = result.bindings;
+            auto found = std::find_if(list.begin(), list.end(),
+                                      [](const auto &b) { return b.kind == ComputeViewKind::heap_sampler; });
+            if (found == list.end())
+                list.push_back({ComputeViewKind::heap_sampler, compute_sampler_heap, 0, 0, bytes});
+            else
+                found->required_bytes = (std::max)(found->required_bytes, bytes);
+            return {true, entry};
         }
         if (comparison) {
             // Field constraints from pixel_aot.comparison_sampler_state. The
@@ -891,7 +922,7 @@ struct Emit {
             all.push_back(sampler);
             it = std::prev(all.end());
         }
-        return first_sampler+static_cast<unsigned>(it - all.begin());
+        return {false, first_sampler + static_cast<unsigned>(it - all.begin())};
     }
     void image(const Inst &i, const State &state) {
         unsigned mask = (i.a >> 8) & 15, base = ((i.b >> 16) & 31) * 4, addr = i.b & 255;
@@ -927,7 +958,10 @@ struct Emit {
         if (lod || gather) {
             if (gather && mask != 1)
                 refuse(i.pc, "unsupported gather channel");
-            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler_index(i, state, lod)
+            const auto sampler = sampler_index(i, state, lod);
+            if (sampler.heap)
+                refuse(i.pc, "sampler heap reads need the direct DXIL path");
+            body << "t=" << tex << (lod ? ".SampleLevel(" : ".GatherRed(") << "q" << sampler.index
                  << ",float2(asfloat(" << x << "),asfloat(" << y << "))" << (lod ? ",0);\n" : ");\n");
         } else
             body << "t=" << tex << ".Load(int3(" << x << "," << y << ",0));\n";
@@ -1319,6 +1353,8 @@ struct Emit {
             if (i.op < 8) {
                 if (s.at(i.src[0]).type != Symbol::Type::table)
                     refuse(i.pc, "unknown scalar table base");
+                if (s.at(i.src[0]).value == compute_sampler_heap)
+                    refuse(i.pc, "sampler heap reads need the direct DXIL path");
                 if (s.at(i.src[0]).value == compute_resource_heap && i.b >> 25 == 125)
                     refuse(i.pc, "unsupported immediate whole-heap descriptor");
                 if (i.b >> 25 != 125) {
@@ -1525,8 +1561,10 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     }
     // In this compute ABI the two directly indexed heaps follow the user root parameters.
     // Require both flags and exactly two remaining user SGPRs, as in the matched native layouts.
-    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user)
+    if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user) {
         initial[next] = {Symbol::Type::table, compute_resource_heap};
+        initial[next + 1] = {Symbol::Type::table, compute_sampler_heap};
+    }
     const bool wave64 = stage && !stage->wave32;
     // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
     const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
