@@ -21,4 +21,3 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | native/compute-heap-view-contract (#3023 heap views on in-runtime compute) | PC-Joshua | 2026-11-27 06:16 | design |
 | native/heap-mixed-raw-typed (#3023 mixed raw+typed heap reads) | PC-Joshua | 2026-11-27 11:04 | design round 1 |
 | native/heap-mixed-raw-typed (#3023 mixed raw+typed heap contract) | PC-Joshua | 2026-11-27 12:32 | design review |
-| shader/raw-load-scalar-offset (direct raw buffer loads: off addressing and SGPR offset) | PC-Joshua | 2026-11-27 18:17 | starting |
