@@ -20,3 +20,4 @@ abandoned. Never edit another machine's line. Only branch names and times go her
 | native/global-srv-heap-replay (#2908 capture+replay fixture) | PC-Joshua | 2026-11-26 21:53 | taken over from tedin7 #2912 |
 | native/compute-heap-view-contract (#3023 heap views on in-runtime compute) | PC-Joshua | 2026-11-27 06:16 | design |
 | native/heap-typed-load (#3023 stage 2 typed heap loads) | PC-Joshua | 2026-11-27 08:28 | probing, builds on #3025 |
+| native/heap-typed-dword-load (#3023 typed heap loads) | PC-Joshua | 2026-11-27 09:56 | design round 2 |
