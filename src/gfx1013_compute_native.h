@@ -112,6 +112,11 @@ struct NativeComputeShader {
 // The view class a GPU-selected descriptor heap slot is read as. none: the slot and its view type are not known, so a
 // heap read is refused. raw_buffer: the capture says the selected slot is a raw buffer SRV. other: the capture names a
 // view type that is not translated (refused when the shader reads the heap).
+// Under raw_buffer the direct path also reads the byte-address rewrite of the selected descriptor (stride read,
+// max(stride, 1), byte count, stride cleared, raw out-of-bounds mode) as the same raw view. The caller guarantees that
+// every slot the program can select is a raw view whose size is the guest range num_records * max(stride, 1); the
+// translator does not check that, nor the swizzle bits (word 1 bits 31:30) or the other word 3 fields, and a program
+// with two heap loads from different selectors is outside what one captured selection covers.
 enum class HeapViewContract : unsigned { none, raw_buffer, other };
 NativeComputeShader translate_compute(const ComputeRequest &request, unsigned entry_byte_offset,
                                       bool direct_dxil = false);

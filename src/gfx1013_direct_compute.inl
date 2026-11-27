@@ -26,6 +26,8 @@ struct DirectCompute {
     bool wave64 = false;
     // The view class a GPU-selected heap slot is read as; see HeapViewContract.
     HeapViewContract heap_view = HeapViewContract::none;
+    // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
+    bool heap_window = false;
     // Binary16 add, sub, subrev and mul are lowered only while MODE stays at
     // the contract this path implements: round-to-nearest-even, f16 denormals
     // kept on input and output, and FP16_OVFL clear. mode_bits holds the
@@ -279,16 +281,30 @@ struct DirectCompute {
     // A raw buffer SRV chosen by a GPU value in the whole descriptor heap: ResourceDescriptorHeap[slot]. The view class the
     // shader reads is the one this handle is annotated with (raw buffer); a slot holding another class is refused by the
     // dispatch before the shader runs. The binding names the heap (no table register); the pipeline indexes it directly.
+    // A byte window is the byte-address rewrite of that descriptor (word 0 copied, word 1 without stride, word 2 the
+    // byte count, word 3 with the raw out-of-bounds mode; see byte_descriptor_field): read as the same raw slot view.
     string heap_resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes) {
         const auto &symbol = s.at(base);
         refuse_heap_contract(i.pc);
-        if (kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv)
+        const bool window = kind == ComputeViewKind::byte_window_srv;
+        if (kind != ComputeViewKind::raw_vector_srv && kind != ComputeViewKind::buffer_srv && !window)
             refuse(i.pc, "a GPU-selected heap slot is read as a raw buffer SRV only");
         if (symbol.offset % 32 || s[base].type != Symbol::Type::indexed_descriptor)
             refuse(i.pc, "unaligned heap descriptor");
+        // Precaution: the rewritten words are compared by the pc of their heap load, which a loop executes again for
+        // another selection.
+        if (window)
+            for (const auto &inst : analysis.program.code)
+                if (inst.branch() && inst.target() <= inst.pc)
+                    refuse(i.pc, "heap byte window in a program with a backward branch");
+        constexpr Symbol::Type window_words[] = {Symbol::Type::indexed_descriptor, Symbol::Type::zero_stride_word,
+                                                 Symbol::Type::byte_count, Symbol::Type::byte_oob};
         for (unsigned j = 1; j < 4; ++j) {
             Symbol expected = symbol;
-            expected.offset += 4 * j;
+            if (window)
+                expected.type = window_words[j];  // field() already cleared the word offset
+            else
+                expected.offset += 4 * j;
             if (!(s.at(base + j) == expected))
                 refuse(i.pc, "non-contiguous resource descriptor");
         }
@@ -1472,7 +1488,7 @@ struct DirectCompute {
             } else write_ballot(*dst, carry);
             return;
         }
-        if (auto field = byte_descriptor_field(i,state)) {
+        if (auto field = byte_descriptor_field(i,state,heap_window)) {
             // Keep derived words symbolic, including the status bit until a
             // later instruction overwrites it. Never let a numeric branch
             // observe a placeholder for this field or its SCC.
@@ -1640,6 +1656,8 @@ struct DirectCompute {
                 descriptor.offset % 32 == 4 && field.type == Symbol::Type::constant && field.value == 0xe0010) {
                 // Reachable only through a heap descriptor load, which needs the raw_buffer contract. A raw buffer view
                 // has no stride to read, so the stride of a GPU-selected slot stays untranslated in the direct path.
+                // With the raw_buffer contract a stride read into s0-s105 is tracked symbolically
+                // (byte_descriptor_field) and does not reach here.
                 refuse_heap_contract(i.pc);
                 refuse(i.pc, "a GPU-selected heap slot stride read is not translated with a view contract");
             }

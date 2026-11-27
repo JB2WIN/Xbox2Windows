@@ -437,12 +437,15 @@ Symbol source(const Inst &i, unsigned code, const State &s) {
 unsigned memory_count(const Inst &i) { return 1u << (i.op & 7); }
 // Derive the rewritten byte-address V# symbolically. Each field carries its
 // source table/slot identity. Numeric consumption still requires real bits.
-static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s) {
+// heap_window: the direct path under HeapViewContract::raw_buffer also rewrites a
+// descriptor loaded from the GPU-selected heap slot (its words keep the load pc).
+static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s, bool heap_window = false) {
     using T = Symbol::Type;
     if (i.enc != Encoding::Sop2 || i.dst > 105) return {};
     auto a = source(i, i.src[0], s), b = source(i, i.src[1], s);
-    auto component = [](const Symbol &v, unsigned ch) {
-        return v.type == T::descriptor && v.offset % 32 == ch*4 && v.value != compute_resource_heap;
+    auto component = [heap_window](const Symbol &v, unsigned ch) {
+        return v.offset % 32 == ch*4 && ((v.type == T::descriptor && v.value != compute_resource_heap) ||
+               (heap_window && v.type == T::indexed_descriptor && v.value == compute_resource_heap));
     };
     auto field = [](Symbol v, T kind) {
         v.type = kind;
@@ -464,7 +467,7 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
         return field(a,T::byte_oob);
     return {};
 }
-State transfer(const Inst &i, State s, bool wave64, bool graphics) {
+State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window = false) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
@@ -483,7 +486,7 @@ State transfer(const Inst &i, State s, bool wave64, bool graphics) {
                (i.src[0] == 193 || i.src[0] == 128) && (i.src[1] == 193 || i.src[1] == 128)) {
         set(i.dst,{Symbol::Type::uniform_mask,i.pc,0});
         set(i.dst+1,{Symbol::Type::uniform_mask,i.pc,1});
-    } else if (auto field = byte_descriptor_field(i,s)) {
+    } else if (auto field = byte_descriptor_field(i,s,heap_window)) {
         set(i.dst,*field);
     } else if (i.enc == Encoding::FixedSetup) {
         for (unsigned r = i.dst; r < i.dst + i.op && r < s.size(); ++r) s[r] = {};
@@ -621,7 +624,8 @@ std::map<unsigned, Inst> fixed_vertex_loads(const string &code) {
     }
     return found ? result : std::map<unsigned, Inst>{};
 }
-Program parse(const string &code, unsigned entry, const State &initial, bool graph, bool graphics=false, bool wave64=false, bool fixed_vertex=false) {
+Program parse(const string &code, unsigned entry, const State &initial, bool graph, bool graphics=false, bool wave64=false, bool fixed_vertex=false,
+              bool heap_window=false) {
     Program p;
     p.graphics_wave64 = graphics && wave64;
     if ((entry & 3) || entry >= code.size() || code.size() > 1u << 20)
@@ -670,7 +674,7 @@ Program parse(const string &code, unsigned entry, const State &initial, bool gra
         auto k = work.front();
         work.pop_front();
         auto &i = p.code[k];
-        auto after = transfer(i, p.before[k], wave64, graphics);
+        auto after = transfer(i, p.before[k], wave64, graphics, heap_window);
         auto merge = [&](size_t t) {
             bool changed = !p.reached[t];
             auto &in = p.before[t];
@@ -1502,7 +1506,9 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
     if (!stage && (UINT(layout->Desc_1_1.Flags) & 0xc00u) == 0xc00u && next + 2 == user)
         initial[next] = {Symbol::Type::table, compute_resource_heap};
     const bool wave64 = stage && !stage->wave32;
-    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64);
+    // The byte-address rewrite of a GPU-selected heap descriptor is read only under the raw_buffer contract.
+    const bool heap_window = direct_dxil && heap_view == HeapViewContract::raw_buffer;
+    auto program = parse(request.code, entry, initial, direct_dxil, false, wave64, false, heap_window);
     Emit emit{{}, program,layout->Desc_1_1};
     emit.result.constants = constants;
     if (!lds)
@@ -1513,6 +1519,7 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
         DirectCompute compiler{emit};
         compiler.wave64 = wave64;
         compiler.heap_view = heap_view;
+        compiler.heap_window = heap_window;
         if (threads % (wave64 ? 64 : 32))
             for (const auto &i : program.code)
                 if (i.name == "v_readlane_b32" || i.name == "v_writelane_b32")
