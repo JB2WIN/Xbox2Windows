@@ -31,12 +31,13 @@ Issue #2908, branch `cpp-migration`. Builds on the heap read in the direct C++ D
   select <slot>
   need <type>
   slot <n> <type> <stride> <bytes>
+  dword <n> <channels>   (after the slot lines; typed buffers of 32-bit channels only, #3023)
   ```
 
 - `compile_dxil ... gfx1013-container-cs` reads an optional `req_<key>.views` next to the `.cdx` (single file and
   `--requests`). It decodes the file, refuses a selection whose slot holds another view type than `need`, refuses a `need`
-  other than `raw_buffer`, translates with the `raw_buffer` contract and prints `global_srv select=<n> need=<type>`. Every
-  refusal happens before the `.cso` is published. Without the file a heap-reading shader is refused as before. The
+  other than `raw_buffer` or a one-channel 32-bit `typed_buffer` (#3023), translates with the matching contract and
+  prints `global_srv select=<n> need=<type>`. Every refusal happens before the `.cso` is published. Without the file a heap-reading shader is refused as before. The
   `.views` file is not part of the `.cdx`/`.root` content key: it describes one captured dispatch.
 
 ## Meaning of "native recording" and "runtime path" here
@@ -132,10 +133,31 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   the window binding as the same raw view). `native_direct_container` compiles both formats through a compute table
   window and refuses the window without the byte-count product. Against `837728dd` the heap check fails at the
   `twindow_loop` shape (text "non-contiguous resource descriptor").
+- Typed heap loads (#3023): under the new `HeapViewContract::typed_dword` a one-channel typed load
+  (`buffer_load_format_x`, an `idxen` element index) through the GPU-selected heap descriptor reads
+  `ResourceDescriptorHeap[slot]` as a typed buffer of one U32 component (binding kind `heap_typed_srv`, cache identity
+  `/heap-view/typed_dword`). `.views` gains a `dword <slot> <channels>` line for each typed buffer slot of 32-bit
+  channels; `compile_dxil` and the fixture derive the contract from `need typed_buffer` when every captured typed
+  buffer slot is a one-channel 32-bit buffer (`x2w_startup::global_srv_contract`). `record` takes
+  `--need typed_buffer`. `native_global_srv_heap_replay_hardware` passes with 122 assertions: the typed load is
+  recorded for slot 3 (`R32_UINT`), compiled, compiled again from the frontend cache, and replayed (output equals the
+  slot 3 data); replaying it against slot 0 reports a mismatch; selections 0 and 2 are refused before the dispatch;
+  ten compile refusals cover a two-channel load, a raw load and a `tbuffer` load under the typed contract, the typed
+  load under the raw contract, and metadata without the `dword` line, with a channel count of 5, with a `dword` line for
+  a raw slot, a duplicate or an early `dword` line, or with another selection. On the local capture (counts only) all 906 typed heap loads behind the raw contract have this
+  one-channel `idxen` shape; with `typed_dword` forced by an uncommitted switch, 895 of those programs then stop at a
+  raw heap read of another slot: they read the heap both ways, which one captured selection does not cover.
 
 ## Limits
 
-- Only raw buffer heap reads are translated; other view classes are refused with a named diagnostic.
+- Only raw buffer heap reads (`raw_buffer`) and one-channel 32-bit typed buffer heap reads (`typed_dword`) are
+  translated, one class per program; other view classes are refused with a named diagnostic.
+- Under `typed_dword` the translator sees no descriptor values. The caller guarantees that every selectable slot is an
+  `R32_UINT`, `R32_SINT` or `R32_FLOAT` buffer view bound as `R32_UINT` over the same element range, that the guest
+  descriptor has stride 4, a 32-bit data format, identity `dst_sel_x`, swizzle and `add_tid` disabled, and that its
+  `num_records` is the view's element count (reads past it return 0). `.views` records the resource size, not the
+  view's first element or element count, so `global_srv_contract` checks necessary conditions only. Only `R32_UINT`
+  slots are exercised; `R32_SINT` and `R32_FLOAT` are accepted but untested. No runtime binds a typed heap slot yet.
 - The selected slot's index is per-lane VGPR data in general; reads stay inside the raw buffer view, which returns 0
   out of bounds. No static index bound is checked.
 - Replay regenerates the slot contents deterministically from the slot index; `.views` captures type, stride and size,
@@ -156,8 +178,8 @@ ctest --preset dev --no-tests=error -R "^native_global_srv_heap_replay(_warp|_ha
   `max(stride, 1) * num_records` bytes (`indirect_table_buffer`, `src/startup_stubs/d3d12_draw.inl`), the guest
   window's byte count, or of the title's own view size for a view token. No fixture runs this manifest path for a
   window.
-- Typed loads (`buffer_load_format_*`) through a heap descriptor and scalar loads through the rewritten descriptor stay
-  refused. The startup runtime
+- Multi-channel typed heap loads, typed loads under the raw contract and scalar loads through the rewritten descriptor
+  stay refused. The startup runtime
   does not pass a contract yet, so none of this reaches a title run (#3023).
 - The captured `select` must be the slot index the dispatch addresses; producing it from a title capture is outside this
   fixture.
