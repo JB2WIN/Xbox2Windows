@@ -14,7 +14,9 @@
 // A shader that picks its slots at run time can only be recorded and replayed if the type of every slot it may pick is
 // known: the capture keeps {slot, type, stride, bytes} for each slot of the heap (and the 32-bit channel count of a
 // typed buffer slot), and the dispatch is refused, before any shader runs, when the selected slot holds another type
-// than the one the shader reads. No heap-indexed data read is translated here; this header only classifies,
+// than the one the shader reads. Under raw_and_typed_dword each selection's type comes from the capture
+// (`need`/`also`), not from the shader, so this check is necessary but not sufficient: which load reads which slot
+// stays a caller guarantee (HeapViewContract). No heap-indexed data read is translated here; this header only classifies,
 // serializes and checks, and names the heap view contract a request allows (global_srv_contract).
 //
 // A .views file describes the one dispatch it was captured from. It is not part of the .cdx/.root content key of the
