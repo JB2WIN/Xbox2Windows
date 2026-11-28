@@ -1043,6 +1043,15 @@ target_compile_features(startup_chad_check PRIVATE cxx_std_17)
 add_dependencies(startup_chad_check startup_stub_chad)
 add_test(NAME startup_chad_check COMMAND startup_chad_check "$<TARGET_FILE:startup_stub_chad>")
 set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
+# Activity counter of the AcpHal and XApu stand-ins (X2W_AUDIO_ACTIVITY=1): exact counts, a zero-write control, the
+# same results with the counter on and off, and a caller that unloads both DLLs and must exit cleanly
+# (docs/startup-runtime.md).
+add_executable(startup_acphal_xma_activity tests/startup_acphal_xma_activity.cpp)
+target_compile_features(startup_acphal_xma_activity PRIVATE cxx_std_17)
+add_dependencies(startup_acphal_xma_activity startup_stub_acphal startup_stub_xapu)
+add_test(NAME startup_acphal_xma_activity COMMAND startup_acphal_xma_activity "$<TARGET_FILE:startup_stub_acphal>"
+    "$<TARGET_FILE:startup_stub_xapu>")
+set_tests_properties(startup_acphal_xma_activity PROPERTIES TIMEOUT 60)
 
 # BMP writer of the draw dumps (src/startup_stubs/draw_bmp.h); the mutated runs are negative controls.
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
@@ -4550,7 +4559,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_compute_mbcnt_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast f-second-fill g-swapped-offsets g-overlap
-                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept
+                j-scalar-dropped h-inner-unpredicated k-block-entered m-else-unswitched n-unmasked o-mask-kept o-subset-remask-dropped
                 n-dropped-broadcast p-dropped-andn2 p-dropped-or p-block-entered q-block-entered q-not-all-ones
                 s-min-strict s-borrow-flipped)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
