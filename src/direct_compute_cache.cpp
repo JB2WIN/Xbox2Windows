@@ -797,9 +797,15 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
                 b.kind == ComputeViewKind::byte_window_srv) {
                 srv_lines << "srv " << b.shader_register << " buf table " << b.root_parameter << ' ' << b.byte_offset
                           << '\n';
-            } else if (b.kind == ComputeViewKind::texture_srv && b.image_dimension == 1 && b.array_count == 1) {
-                srv_lines << "srv " << b.shader_register << " tex2d table " << b.root_parameter << ' ' << b.byte_offset
-                          << '\n';
+            } else if (b.kind == ComputeViewKind::texture_srv && b.array_count == 1 &&
+                       (b.image_dimension == 0 || b.image_dimension == 1 || b.image_dimension == 2 ||
+                        b.image_dimension == 5)) {
+                const char *tex = b.image_dimension == 0   ? "tex1d"
+                                  : b.image_dimension == 1 ? "tex2d"
+                                  : b.image_dimension == 2 ? "tex3d"
+                                                           : "tex2da";
+                srv_lines << "srv " << b.shader_register << ' ' << tex << " table " << b.root_parameter << ' '
+                          << b.byte_offset << '\n';
             } else {
                 return refuse(view_shape("SRV", b));
             }
