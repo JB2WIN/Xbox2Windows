@@ -181,7 +181,29 @@ x2w::GraphicsRequest read_rtv_variant(const fs::path &marker) {
     request.rtv_formats = std::move(formats);
     return request;
 }
+void read_pixel_inputs(const fs::path &marker, uint64_t expected, Bytes &entry, Bytes &description) {
+    if (fs::exists(fs::path(marker).replace_extension(".psin")))
+        parse_pixel_inputs(marker, expected, entry, description);
+    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
+        if (!entry.empty())
+            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
+        entry = part(marker, ".ps57in", 12);
+        if (entry.size() != 12 || entry.compare(0, 4, "PSI1"))
+            throw std::runtime_error("invalid slot-57 pixel entry record");
+        description = entry;
+    }
+}
 } // namespace
+
+std::string x2w::read_pixel_input_description(const fs::path &base_marker) {
+    const auto stem = base_marker.stem().string();
+    if (base_marker.extension() != ".a" || stem.size() != 20 || stem.compare(0, 4, "req_"))
+        throw std::runtime_error("expected req_<16 hex digits>.a");
+    const uint64_t expected = parse_request_stem(stem, "invalid graphics request key");
+    Bytes entry, description;
+    read_pixel_inputs(base_marker, expected, entry, description);
+    return description;
+}
 
 x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
     if (marker.extension() == ".rtv") return read_rtv_variant(marker);
@@ -193,16 +215,7 @@ x2w::GraphicsRequest x2w::read_graphics_request(const fs::path &marker) {
                             part(marker, ".root", 16 << 20), {}, {}, {}, expected};
     if (fs::exists(fs::path(marker).replace_extension(".ia")))
         request.input_layout = part(marker, ".ia", 1 << 20);
-    if (fs::exists(fs::path(marker).replace_extension(".psin")))
-        parse_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
-    if (fs::exists(fs::path(marker).replace_extension(".ps57in"))) {
-        if (!request.pixel_entry.empty())
-            throw std::runtime_error("conflicting stream and slot-57 pixel entry records");
-        request.pixel_entry = part(marker, ".ps57in", 12);
-        if (request.pixel_entry.size() != 12 || request.pixel_entry.compare(0, 4, "PSI1"))
-            throw std::runtime_error("invalid slot-57 pixel entry record");
-        request.pixel_input_description = request.pixel_entry;
-    }
+    read_pixel_inputs(marker, expected, request.pixel_entry, request.pixel_input_description);
     const auto request_key = [&](std::string_view revision) {
         uint64_t key = 1469598103934665603ull;
         hash_bytes(key, revision.data(), revision.size());

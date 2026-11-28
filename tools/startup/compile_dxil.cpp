@@ -693,6 +693,18 @@ struct WatchRequest {
     bool compute = false;
 };
 
+static bool read_small_file(const fs::path& path, size_t max_bytes, std::string& out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        return false;
+    const auto size = file.tellg();
+    if (size < 0 || static_cast<size_t>(size) > max_bytes)
+        return false;
+    out.assign(static_cast<size_t>(size), '\0');
+    file.seekg(0);
+    return !size || static_cast<bool>(file.read(out.data(), size));
+}
+
 static bool is_watch_request_pending(const fs::path& request_dir, const WatchRequest& req, bool skip_failed) {
     std::error_code ec;
     const auto marker_mtime = fs::last_write_time(req.marker, ec);
@@ -704,37 +716,35 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     const fs::path psdep_path = fs::path(stem) += L".psdep";
 
     std::optional<fs::file_time_type> psin_mtime;
-    bool dependency_changed = false;
+    bool sidecar_changed = false;
     if (!req.compute) {
         if (const auto psin_path = graphics_psin_path(req.marker)) {
             const auto packed_path = fs::path(*psin_path).replace_extension(L".ps57in");
             const bool stream = fs::is_regular_file(*psin_path, ec);
             const bool packed = fs::is_regular_file(packed_path, ec);
-            std::ifstream dependency(psdep_path, std::ios::binary);
-            char previous[13]{};
-            dependency.read(previous, sizeof(previous));
-            const auto previous_size = dependency.gcount();
-            const bool was_packed = previous_size >= 4 && std::memcmp(previous, "PSI1", 4) == 0;
-            if (packed) {
-                // A copied sidecar may carry a timestamp older than the published manifest.
-                std::ifstream input(packed_path, std::ios::binary);
-                char current[13]{};
-                input.read(current, sizeof(current));
-                dependency_changed = stream || !was_packed || previous_size != 12 || input.gcount() != 12 ||
-                    std::memcmp(current, previous, 12) != 0;
-            } else {
-                dependency_changed = was_packed || (stream != (previous_size != 0));
-            }
             if (stream || packed) {
                 const auto time = fs::last_write_time(stream ? *psin_path : packed_path, ec);
                 if (!ec)
                     psin_mtime = time;
             }
+            const bool has_psdep = fs::is_regular_file(psdep_path, ec);
+            std::string published_dep;
+            if (has_psdep && (!read_small_file(psdep_path, 256, published_dep) || published_dep.empty())) {
+                sidecar_changed = true;
+            } else {
+                try {
+                    const std::string current_dep =
+                        x2w::read_pixel_input_description(fs::path(*psin_path).replace_extension(L".a"));
+                    sidecar_changed = current_dep != published_dep;
+                } catch (const std::exception&) {
+                    sidecar_changed = true;
+                }
+            }
         }
     }
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
-    if (has_manifest && !dependency_changed) {
+    if (has_manifest && !sidecar_changed) {
         const auto manifest_mtime = fs::last_write_time(manifest_path, ec);
         if (!ec && !(psin_mtime.has_value() && *psin_mtime > manifest_mtime)) {
             if (req.compute) {
@@ -748,7 +758,7 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
         }
     }
 
-    const bool recheck = dependency_changed && has_manifest;
+    const bool recheck = sidecar_changed && has_manifest;
     if (skip_failed && !recheck && fs::is_regular_file(fail_path, ec)) {
         const auto fail_mtime = fs::last_write_time(fail_path, ec);
         const auto latest_input =
@@ -1160,6 +1170,8 @@ int wmain(int argc, wchar_t** argv) {
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+                else
+                    fs::remove(psdep_path, ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
             fs::remove(fs::path(stems[i]) += L".fail", ignored);
