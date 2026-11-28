@@ -17959,6 +17959,8 @@ python -B tests/docs_links_check.py
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
 
+See [fixed mesh pipelines through slot 57](experiments/native-fixed-mesh57.md) for the source-built indirect-draw fixtures.
+
 ## Binary16 normalized integer conversions (`v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`) across VOP1/VOP3/DPP16/DPP8/SDWA in pixel_aot
 
 [The pixel shader translator](../tools/pixel_aot.py) adds 10 exact binary16 normalized integer conversion forms across all 5 encodings (counted in both `docs/coverage/gfx1013.tsv` and `docs/coverage/rdna2.tsv`):
