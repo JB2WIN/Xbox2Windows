@@ -55,13 +55,17 @@ def check(folder, consumer, sdk, adapter, compiler):
     assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
     assert all(path.read_bytes() == expected for path, expected in published.items())
     print(f"{adapter} existing disk pair takes precedence with native enabled")
-    for fault, diagnostic in (("MANIFEST", "unsupported manifest version"), ("ROOT", "failed 0x80004005")):
+    faults = (
+        ("missing DXC", {"X2W_NATIVE_SHADERS": str(folder / "missing-sdk")}, "native graphics "),
+        ("manifest", {"X2W_TEST_NATIVE_GRAPHICS_MANIFEST_FAILURE": "1"}, "unsupported manifest version"),
+        ("root", {"X2W_TEST_NATIVE_GRAPHICS_ROOT_FAILURE": "1"}, "failed 0x80004005"),
+    )
+    for fault, override, diagnostic in faults:
         manifest.rename(str(manifest) + ".pending")
         first = Path(str(pixels) + ".first")
         first.unlink(missing_ok=True)
         pixels.unlink()
-        fault_env = dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest), X2W_NATIVE_SHADERS_ONLY="0")
-        fault_env[f"X2W_TEST_NATIVE_GRAPHICS_{fault}_FAILURE"] = "1"
+        fault_env = dict(env, X2W_TEST_PUBLISH_MANIFEST=str(manifest), X2W_NATIVE_SHADERS_ONLY="0", **override)
         run = subprocess.run(args, env=fault_env, capture_output=True, text=True, timeout=45)
         assert run.returncode == 0 and diagnostic in run.stderr and "-> drawn;" in run.stderr, run.stderr
         assert first.read_bytes() == clear * 32
