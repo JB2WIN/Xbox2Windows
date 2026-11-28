@@ -650,7 +650,7 @@ static std::optional<Symbol> byte_descriptor_field(const Inst &i, const State &s
     return {};
 }
 State transfer(const Inst &i, State s, bool wave64, bool graphics, bool heap_window, bool direct,
-               bool narrow_wave64) {
+                 bool narrow_wave64 = false) {
     auto set = [&](unsigned n, Symbol v) {
         if (n >= s.size())
             refuse(i.pc, "invalid SGPR");
