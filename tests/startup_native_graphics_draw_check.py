@@ -49,6 +49,12 @@ def check(folder, consumer, sdk, adapter, compiler):
     manifest = cache / (marker.stem.removeprefix("req_") + ".txt")
     published = {p: p.read_bytes() for p in
                  (manifest, manifest.with_suffix(".vs.cso"), manifest.with_suffix(".ps.cso"))}
+    published_draw = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
+    assert published_draw.returncode == 0 and "-> drawn;" in published_draw.stderr, published_draw.stderr
+    assert "native graphics " not in published_draw.stderr, published_draw.stderr
+    assert pixels.read_bytes() == (red * 4 + clear * 4) * 4
+    assert all(path.read_bytes() == expected for path, expected in published.items())
+    print(f"{adapter} existing disk pair takes precedence with native enabled")
     for fault, diagnostic in (("MANIFEST", "unsupported manifest version"), ("ROOT", "failed 0x80004005")):
         manifest.rename(str(manifest) + ".pending")
         first = Path(str(pixels) + ".first")
