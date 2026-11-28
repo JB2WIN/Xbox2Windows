@@ -46,7 +46,8 @@ def check(folder, consumer, sdk, adapter, compiler):
     # Publish a verified disk pair, then hold back its ready marker until after the first draw.
     subprocess.run([compiler, "--watch", sdk, cache, cache, "--once"], check=True, timeout=45)
     marker, = cache.glob("req_*.a")
-    manifest = cache / (marker.stem.removeprefix("req_") + ".txt")
+    key = marker.stem.removeprefix("req_")
+    manifest = cache / f"{key}.txt"
     published = {p: p.read_bytes() for p in
                  (manifest, manifest.with_suffix(".vs.cso"), manifest.with_suffix(".ps.cso"))}
     published_draw = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45)
@@ -56,7 +57,7 @@ def check(folder, consumer, sdk, adapter, compiler):
     assert all(path.read_bytes() == expected for path, expected in published.items())
     print(f"{adapter} existing disk pair takes precedence with native enabled")
     faults = (
-        ("missing DXC", {"X2W_NATIVE_SHADERS": str(folder / "missing-sdk")}, "native graphics "),
+        ("missing DXC", {"X2W_NATIVE_SHADERS": str(folder / "missing-sdk")}, f"native graphics {key} refused:"),
         ("manifest", {"X2W_TEST_NATIVE_GRAPHICS_MANIFEST_FAILURE": "1"}, "unsupported manifest version"),
         ("root", {"X2W_TEST_NATIVE_GRAPHICS_ROOT_FAILURE": "1"}, "failed 0x80004005"),
     )
