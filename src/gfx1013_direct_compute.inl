@@ -34,6 +34,7 @@ struct DirectCompute {
     bool half_mode_known = true;
     unsigned mode_bits = 0xf0;
     std::vector<bool> scc_live;
+    std::map<std::pair<unsigned,unsigned>,string> descriptor_strides;
     unsigned label_number = 0;
     bool pixel_stage = false;
     bool pixel_heap_enabled = false;
@@ -278,7 +279,7 @@ struct DirectCompute {
         initialize_constants();
     }
     void initialize_constants(const GraphicsConstantLayout *linked = nullptr) {
-        unsigned words = 0;
+        unsigned words = static_cast<unsigned>(descriptor_strides.size());
         for (const auto &block : analysis.result.constants)
             words += block.count;
         if (words) {
@@ -287,18 +288,21 @@ struct DirectCompute {
             auto h = ir.handle({2, 0, 13, 0, 0, (words + 3) / 4 * 16});
             unsigned pos = 0;
             std::map<unsigned, string> vectors;
+            const auto word_at = [&](unsigned at) {
+                auto &vec = vectors[at / 4];
+                if (vec.empty())
+                    vec = ir.invoke("%dx.types.CBufRet.i32", "cbufferLoadLegacy.i32", 59,
+                                    {{"%dx.types.Handle", h}, {"i32", to_string(at / 4)}}, "nounwind readonly");
+                return ir.value("extractvalue %dx.types.CBufRet.i32 " + vec + ", " + to_string(at % 4));
+            };
             for (const auto &block : analysis.result.constants) {
                 if (linked)
                     pos = linked->offset(block.root_parameter);
-                for (unsigned j = 0; j < block.count; ++j, ++pos) {
-                    auto &vec = vectors[pos / 4];
-                    if (vec.empty())
-                        vec = ir.invoke("%dx.types.CBufRet.i32", "cbufferLoadLegacy.i32", 59,
-                                        {{"%dx.types.Handle", h}, {"i32", to_string(pos / 4)}}, "nounwind readonly");
-                    write(block.first_sgpr + j,
-                          ir.value("extractvalue %dx.types.CBufRet.i32 " + vec + ", " + to_string(pos % 4)));
-                }
+                for (unsigned j = 0; j < block.count; ++j, ++pos)
+                    write(block.first_sgpr + j, word_at(pos));
             }
+            for (auto &entry : descriptor_strides)
+                entry.second = ir.binary("and",word_at(pos++),"16383");
         }
     }
     // Refuses a GPU-selected heap read that the contract does not cover. raw_buffer is the only class that is translated.
@@ -1446,6 +1450,19 @@ struct DirectCompute {
         return select(nan, "32256",
             select(product_inf, ir.binary("or", product_sign, "31744"), select(c_inf, c, finite)));
     }
+    static std::optional<uint32_t> packed_f16_inline_constant(unsigned r) {
+        if (r >= 240 && r <= 248) {
+            // On gfx1013 (RDNA 2), inline binary16 float constants occupy bits [15:0] with bits [31:16] zeroed.
+            constexpr uint32_t halves[]{0x3800u, 0xb800u, 0x3c00u, 0xbc00u, 0x4000u,
+                                        0xc000u, 0x4400u, 0xc400u, 0x3118u};
+            return halves[r - 240];
+        }
+        if (r >= 128 && r <= 192)
+            return r - 128u;
+        if (r >= 193 && r <= 208)
+            return static_cast<uint32_t>(192u - r);
+        return std::nullopt;
+    }
     void packed_f16_alu(const Inst &i) {
         const bool fused = i.name == "v_pk_fma_f16";
         if (i.enc != Encoding::Mix || i.clamp || (!fused && (i.src[2] || (i.a & 0x2400) || (i.neg & 4))))
@@ -1455,9 +1472,12 @@ struct DirectCompute {
         std::array<string, 3> words;
         for (unsigned j = 0; j < (fused ? 3u : 2u); ++j) {
             unsigned r = i.src[j];
-            if (r > 105 && r < 256 && r != 128 && r != 255)
+            if (auto inline_word = packed_f16_inline_constant(r))
+                words[j] = to_string(*inline_word);
+            else if (r <= 105 || r == 255 || (r >= 256 && r < 512))
+                words[j] = operand32(i, r);
+            else
                 refuse(i.pc, "unsupported packed binary16 arithmetic source");
-            words[j] = operand32(i, r);
         }
         auto lane = [&](unsigned selectors, unsigned negate) {
             auto operand = [&](unsigned j) {
@@ -1822,8 +1842,13 @@ struct DirectCompute {
                 refuse(i.pc, "unsupported " + string(n) + " SDWA form");
             if (i.scale)
                 refuse(i.pc, "unsupported " + string(n) + " omod");
-            if (i.wide && (i.a & 0x7800))
+            const unsigned op_sel = i.wide ? (i.a >> 11) & 15u : 0;
+            if (op_sel && (n != "v_fma_f16" || i.enc != Encoding::Vop3 || i.clamp))
                 refuse(i.pc, "unsupported " + string(n) + " high-half op_sel");
+            for (unsigned j = 0; j < 3; ++j) {
+                if ((op_sel & (1u << j)) && i.src[j] < 256)
+                    refuse(i.pc, "unsupported v_fma_f16 high-half op_sel on non-VGPR source");
+            }
             if (n == "v_fmac_f16" && i.wide && (((i.abs | i.neg) & 4) || i.src[2]))
                 refuse(i.pc, "unsupported v_fmac_f16 third-source modifier");
             if (!half_mode_known || ((mode_bits ^ 0xf0u) & 0x8000ccu))
@@ -1831,7 +1856,9 @@ struct DirectCompute {
             auto half_bits = [&](unsigned j) {
                 const unsigned r = i.src[j];
                 string bits;
-                if (r >= 240 && r <= 248) {
+                if (op_sel & (1u << j)) {
+                    bits = ir.binary("lshr", operand32(i, r), "16");
+                } else if (r >= 240 && r <= 248) {
                     constexpr unsigned halves[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
                                                 0xc000, 0x4400, 0xc400, 0x3118};
                     bits = to_string(halves[r - 240]);
@@ -1861,8 +1888,10 @@ struct DirectCompute {
                 auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
                 result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
             }
-            auto kept = ir.binary("and", read(i.dst), "4294901760");
-            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            const bool dst_high = (op_sel & 8u) != 0;
+            auto kept = ir.binary("and", read(i.dst), dst_high ? "65535" : "4294901760");
+            auto placed = dst_high ? ir.binary("shl", result, "16") : ir.binary("and", result, "65535");
+            vector_write(i.dst, ir.binary("or", kept, placed));
             return true;
         }
         const auto rule = alu_rules.find(n);
@@ -2263,6 +2292,56 @@ struct DirectCompute {
         }
         return scc_live[program.at.at(definition.next)];
     }
+    void prepare_descriptor_strides() {
+        const auto &p = analysis.program;
+        const auto &layout = analysis.layout;
+        std::map<std::pair<unsigned,unsigned>,size_t> sources;
+        for (size_t n = 0; n < p.code.size(); ++n) {
+            if (!p.reached[n]) continue;
+            const auto &i = p.code[n];
+            const auto field = byte_descriptor_field(i,p.before[n],heap_window);
+            if (!field || (field->type != Symbol::Type::stride && field->type != Symbol::Type::byte_stride) ||
+                field->definition || field->value >= layout.NumParameters || !uses_scc_after(i))
+                continue;
+            const auto &parameter = layout.pParameters[field->value];
+            if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+                parameter.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
+                continue;
+            // The runtime provides the stride only for a fixed buffer SRV.
+            const auto &table = parameter.DescriptorTable;
+            const auto slot = field->offset / 32;
+            uint64_t next = 0;
+            unsigned srvs = 0, other = 0;
+            for (unsigned j = 0; j < table.NumDescriptorRanges; ++j) {
+                const auto &range = table.pDescriptorRanges[j];
+                const uint64_t start = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                    ? next : range.OffsetInDescriptorsFromTableStart;
+                next = start + range.NumDescriptors;
+                if (start <= slot && slot < next) {
+                    if (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) ++srvs;
+                    else ++other;
+                }
+            }
+            if (srvs == 1 && !other)
+                sources.try_emplace({field->value,field->offset},n);
+        }
+        for (const auto &[source, n] : sources) {
+            const auto [root, offset] = source;
+            if (read_write_raw_views.count(source)) continue;
+            State descriptor;
+            for (unsigned j=0; j<4; ++j)
+                descriptor[j] = {Symbol::Type::descriptor,root,offset+4*j};
+            analysis.binding(p.code[n],descriptor,0,4,ComputeViewKind::raw_vector_srv,4);
+            analysis.result.stride_srvs.push_back(analysis.result.bindings.back().shader_register);
+            descriptor_strides.try_emplace(source);
+        }
+        if (!descriptor_strides.empty()) {
+            size_t words = descriptor_strides.size();
+            for (const auto &block : analysis.result.constants) words += block.count;
+            if (words > 32)
+                refuse(p.code.front().pc,"descriptor stride metadata exceeds the 32-word compute entry layout");
+        }
+    }
     string saturated_add(const string &a, const string &b, bool sign) {
         auto sum = ir.binary("add", a, b);
         if (!sign)
@@ -2285,10 +2364,16 @@ struct DirectCompute {
         if (floating && (!half_mode_known || (mode_bits & 0xc0u) != 0xc0u))
             refuse(i.pc, "unsupported packed binary16 min/max denormal mode");
         auto source = [&](unsigned src) {
+            if (floating) {
+                if (auto inline_word = packed_f16_inline_constant(src))
+                    return to_string(*inline_word);
+            } else if (src >= 128 && src <= 208) {
+                return operand32(i, src);
+            }
             if (src <= 105) {
                 if (state[src].type == Symbol::Type::masked || state[src].type == Symbol::Type::uniform_mask)
                     refuse(i.pc, "packed 16-bit min/max uses a lane mask");
-            } else if (src < 256 && src != 128 && src != 255) {
+            } else if (src < 256 && src != 255) {
                 refuse(i.pc, "unsupported packed 16-bit min/max source");
             }
             return operand32(i, src);
@@ -2528,8 +2613,20 @@ struct DirectCompute {
             // Its SCC is known for every source descriptor.
             if (field->type == Symbol::Type::byte_oob || field->type == Symbol::Type::root_stride_one_high)
                 write(128, "1");
-            else if (n != "s_mul_i32" && uses_scc_after(i))
-                refuse(i.pc, "numeric SCC from a symbolic descriptor field");
+            else if (n != "s_mul_i32" && uses_scc_after(i)) {
+                const auto stride = descriptor_strides.find({field->value,field->offset});
+                if (stride == descriptor_strides.end() || field->definition ||
+                    (field->type != Symbol::Type::stride && field->type != Symbol::Type::byte_stride))
+                    refuse(i.pc, "numeric SCC from a symbolic descriptor field");
+                string condition;
+                if (field->type == Symbol::Type::stride)
+                    condition = cmp("ne",stride->second,"0");
+                else if (source(i,i.src[0],state).type == Symbol::Type::stride)
+                    condition = cmp("ugt",stride->second,"1");
+                else
+                    condition = cmp("ult",stride->second,"1");
+                write(128,ir.value("zext i1 " + condition + " to i32"));
+            }
             if (graphics_input) write(i.dst, {});
             return;
         }
@@ -3849,6 +3946,7 @@ struct DirectCompute {
                                           [](const Inst &i) { return i.enc == Encoding::Lds; });
         if (uses_lds)
             ir.globals << "@lds = internal addrspace(3) global [" << lds_words << " x i32] undef, align 4\n";
+        prepare_descriptor_strides();
         const auto &p = analysis.program;
         mode_bits = 0xf0;
         bool mode_write = false, conditional = false;

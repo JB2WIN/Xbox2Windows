@@ -244,7 +244,11 @@ x2w::ComputeRequest x2w::read_compute_request(const fs::path &marker) {
     constexpr char revision[] = "x2w-startup-shader-29cs";
     if (request_key(revision) != expected && request_key("x2w-startup-shader-28cs") != expected)
         throw std::runtime_error("compute request key mismatch");
-    ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected};
+    // Bit 20 of dword 4 (bits 15:0 are Z): set for wave32, clear for wave64. Inferred from captured requests
+    // (docs/experiments/native-slot67-wave-size.md).
+    const bool wave32 = (static_cast<unsigned char>(sa[18]) & 0x10) != 0;
+    ComputeRequest request{std::move(code), std::move(data), std::move(root), std::move(desc), std::move(sa), std::move(sb), expected,
+                           wave32};
     validate_compute_request_shape(request);
     return request;
 }
