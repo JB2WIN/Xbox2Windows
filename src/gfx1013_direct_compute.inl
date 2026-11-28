@@ -995,6 +995,8 @@ struct DirectCompute {
         if (implicit && !pixel_stage) {
             if (!complete_compute_quads)
                 refuse(i.pc, "implicit derivatives require a pixel stage");
+            if (virtual_waves)
+                refuse(i.pc, "implicit derivatives with virtual wave64 groups");
             compute_derivatives = true;
         }
         const bool gather = i.op == 64 || i.op == 71 || compare_gather;
