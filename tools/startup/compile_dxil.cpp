@@ -225,8 +225,20 @@ static std::optional<std::string> compile_one(x2w::ShaderDxilCompiler& compiler,
         std::ifstream meta(fs::path(input_path).replace_extension(L".pslayout"));
         std::string tag, extra;
         unsigned enable, address, wave;
-        if (!(meta >> tag >> enable >> address >> wave) || tag != "meshps1")
-            throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        if (!(meta >> tag))
+            throw std::runtime_error("raw mesh PS needs a reviewed entry layout");
+        if (tag == "meshps1") {
+            if (!(meta >> enable >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps1 enable address wave (decimal)");
+        } else if (tag == "meshps2") {
+            // As in Victory's native PS reflection, this record names the
+            // inputs delivered by ADDR when a separate ENA mask is unavailable.
+            if (!(meta >> address >> wave))
+                throw std::runtime_error("raw mesh PS needs meshps2 input-address wave (decimal)");
+            enable = address;
+        } else {
+            throw std::runtime_error("unknown raw mesh PS entry layout version");
+        }
         const bool guest_root = bool(meta >> extra);
         if (guest_root && (extra!="guest_root" || (meta >> extra)))
             throw std::runtime_error("unexpected raw mesh PS layout field");
@@ -701,6 +713,18 @@ struct WatchRequest {
     bool compute = false;
 };
 
+static bool read_small_file(const fs::path& path, size_t max_bytes, std::string& out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        return false;
+    const auto size = file.tellg();
+    if (size < 0 || static_cast<size_t>(size) > max_bytes)
+        return false;
+    out.assign(static_cast<size_t>(size), '\0');
+    file.seekg(0);
+    return !size || static_cast<bool>(file.read(out.data(), size));
+}
+
 static bool is_watch_request_pending(const fs::path& request_dir, const WatchRequest& req, bool skip_failed) {
     std::error_code ec;
     const auto marker_mtime = fs::last_write_time(req.marker, ec);
@@ -714,37 +738,36 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
     std::optional<fs::file_time_type> psin_mtime;
     bool dependency_changed = false;
     bool lost = false;
+    bool sidecar_changed = false;
     if (!req.compute) {
         if (const auto psin_path = graphics_psin_path(req.marker)) {
             const auto packed_path = fs::path(*psin_path).replace_extension(L".ps57in");
             const bool stream = fs::is_regular_file(*psin_path, ec);
             const bool packed = fs::is_regular_file(packed_path, ec);
-            std::ifstream dependency(psdep_path, std::ios::binary);
-            char previous[13]{};
-            dependency.read(previous, sizeof(previous));
-            const auto previous_size = dependency.gcount();
-            const bool was_packed = previous_size >= 4 && std::memcmp(previous, "PSI1", 4) == 0;
-            if (packed) {
-                // A copied sidecar may carry a timestamp older than the published manifest.
-                std::ifstream input(packed_path, std::ios::binary);
-                char current[13]{};
-                input.read(current, sizeof(current));
-                dependency_changed = stream || !was_packed || previous_size != 12 || input.gcount() != 12 ||
-                    std::memcmp(current, previous, 12) != 0;
-            } else {
-                dependency_changed = was_packed || (stream != (previous_size != 0));
-            }
             if (stream || packed) {
                 const auto time = fs::last_write_time(stream ? *psin_path : packed_path, ec);
                 if (!ec)
                     psin_mtime = time;
+            }
+            const bool has_psdep = fs::is_regular_file(psdep_path, ec);
+            std::string published_dep;
+            if (has_psdep && (!read_small_file(psdep_path, 256, published_dep) || published_dep.empty())) {
+                sidecar_changed = true;
+            } else {
+                try {
+                    const std::string current_dep =
+                        x2w::read_pixel_input_description(fs::path(*psin_path).replace_extension(L".a"));
+                    sidecar_changed = current_dep != published_dep;
+                } catch (const std::exception&) {
+                    sidecar_changed = true;
+                }
             }
         }
         lost = !psin_mtime.has_value() && fs::is_regular_file(psdep_path, ec);
     }
 
     const bool has_manifest = fs::is_regular_file(manifest_path, ec);
-    if (has_manifest && !lost && !dependency_changed) {
+    if (has_manifest && !sidecar_changed && !lost && !dependency_changed) {
         if (req.compute) {
             // A native manifest from another revision, or an unmarked one without the Python translator's
             // <key>.cs.hlsl, is stale. Other outputs, and a manifest that cannot be read, go on to the usual
@@ -771,7 +794,7 @@ static bool is_watch_request_pending(const fs::path& request_dir, const WatchReq
         }
     }
 
-    const bool recheck = dependency_changed && has_manifest;
+    const bool recheck = sidecar_changed && has_manifest;
     if (skip_failed && !recheck && fs::is_regular_file(fail_path, ec)) {
         const auto fail_mtime = fs::last_write_time(fail_path, ec);
         const auto latest_input =
@@ -1027,7 +1050,7 @@ int wmain(int argc, wchar_t** argv) {
                      "gfx1013-group-clear@BYTE_OFFSET and gfx1013-compute-wave32@BYTE_OFFSET take a req_<key>.c67.\n"
                      "Direct DXIL profiles: gfx1013-direct-cs@BYTE_OFFSET, gfx1013-container-cs, gfx1013-container-vs, gfx1013-container-ps, gfx1013-container-ms.\n"
                      "gfx1013-raw-ms reads guest mesh bytes and an explicit .mslayout sidecar.\n"
-                     "gfx1013-raw-mesh-ps uses an explicit .pslayout sidecar.\n"
+                     "gfx1013-raw-mesh-ps uses a reviewed .pslayout sidecar (meshps1 or meshps2).\n"
                      "gfx1013-container-cs reads an optional req_<key>.views next to the .cdx (GPU-selected heap slot view types).\n"
                      "gfx1013-container-pair accepts two containers and emits VS then PS using the runtime register allocation.\n"
                      "For capture directories use PROFILE --requests DIRECTORY OUTPUT_DIRECTORY. "
@@ -1192,6 +1215,8 @@ int wmain(int argc, wchar_t** argv) {
             if (manifest) {
                 if (!input.pixel_input_description.empty())
                     publish_atomic(psdep_path, input.pixel_input_description.data(), input.pixel_input_description.size());
+                else
+                    fs::remove(psdep_path, ignored);
                 publish_atomic(manifest_path, manifest->data(), manifest->size());
             }
             fs::remove(fs::path(stems[i]) += L".fail", ignored);
