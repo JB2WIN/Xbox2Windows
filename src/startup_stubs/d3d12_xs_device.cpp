@@ -1044,7 +1044,8 @@ void retire_drop_heap_views(Wrapper* heap);
 void retire_note_title_release(Wrapper* w);
 void retire_hold(Wrapper* list, Wrapper* resource);
 void retire_drop_recording(Wrapper* list);
-void release_upload_recording(Wrapper* list);
+void release_list_recording(Wrapper* list);
+void clear_draw_sampler_snapshot(Wrapper* self);
 void retire_discard_holds(Wrapper* list);
 void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists);
 void drain_retired_resources();
@@ -1068,7 +1069,8 @@ ULONG __stdcall release(Wrapper* self)
                 linear_buffers().retire(static_cast<ID3D12Resource*>(self->own().real));
         }
         if (self->own().kind == list_kind && self->own().real) {
-            release_upload_recording(self);
+            release_list_recording(self);
+            clear_draw_sampler_snapshot(self);
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
             retire_drop_recording(self);
         }
@@ -1380,7 +1382,6 @@ void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list);
 void reset_list_dynamic_state(Wrapper* self);
 void discard_list_gpu_writes(Wrapper* self);
 void commit_list_gpu_writes(Wrapper* self);
-void discard_draw_sampler_heaps(ID3D12CommandList* list);
 void discard_address_uploads(ID3D12CommandList* list);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
@@ -1468,6 +1469,8 @@ struct DesktopAllocator {
     // Rectangle-list argument scratch of the recordings on this allocator. Retained with the recording, so until every
     // queue that ran it has passed its fence (the allocator is reused only when idle).
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> scratches;
+    // Translated draws keep their immutable sampler tables for every submission of the recording.
+    std::vector<x2w_startup::ComPtr<ID3D12DescriptorHeap>> sampler_snapshots;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1486,9 +1489,13 @@ LONG upload_resubmits_refused;  // closed lists submitted again after a released
 
 LONG allocator_swaps, allocator_creates;
 
-void release_upload_recording(Wrapper* list)
+void release_list_recording(Wrapper* list)
 {
     AcquireSRWLockExclusive(&allocator_lock);
+    if (const auto found = list_recordings.find(list); found != list_recordings.end()) {
+        --found->second->lists;
+        list_recordings.erase(found);
+    }
     discard_upload_chunks(list->own().upload_chunks, upload_chunks.data(), snapshot_chunks.data());
     released_upload_chunks.erase(list);
     ReleaseSRWLockExclusive(&allocator_lock);
@@ -1509,8 +1516,10 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 bool allocator_idle(const DesktopAllocator* allocator)
 {
     if (allocator->lists || allocator->untracked) return false;
-    for (const auto& submit : allocator->submits)
-        if (submit.first->GetCompletedValue() < submit.second) return false;
+    for (const auto& submit : allocator->submits) {
+        const UINT64 completed = submit.first->GetCompletedValue();
+        if (completed == UINT64_MAX || completed < submit.second) return false;
+    }
     return true;
 }
 
@@ -1582,6 +1591,21 @@ bool retain_with_recording(Wrapper* self, x2w_startup::ComPtr<ID3D12Resource> re
     }
     ReleaseSRWLockExclusive(&allocator_lock);
     return retained;
+}
+
+// Fixture query includes every backing allocator, including old recordings still pending on a queue.
+extern "C" __declspec(dllexport) UINT x2w_d3d12_allocator_sampler_snapshots(void* guest_allocator)
+{
+    Wrapper* allocator = as_wrapper(guest_allocator);
+    if (!allocator || allocator->own().kind != allocator_kind) return 0;
+    AcquireSRWLockShared(&allocator_lock);
+    UINT held = 0;
+    const auto found = title_allocators.find(allocator);
+    if (found != title_allocators.end())
+        for (const auto* backing : found->second.pool)
+            held += static_cast<UINT>(backing->sampler_snapshots.size());
+    ReleaseSRWLockShared(&allocator_lock);
+    return held;
 }
 
 // Fixture query: how many scratch buffers the desktop allocator of this list's latest recording still holds (the
@@ -1679,6 +1703,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             next->uploads.clear();
             next->indexed_validation.clear();
             next->scratches.clear();
+            next->sampler_snapshots.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1858,6 +1883,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
                     spare->uploads.clear();
                     spare->indexed_validation.clear();
                     spare->scratches.clear();
+                    spare->sampler_snapshots.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -1912,7 +1938,6 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     if (SUCCEEDED(hr)) {
         reset_list_dynamic_state(self);
         discard_list_gpu_writes(self);
-        discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
@@ -1951,7 +1976,6 @@ HRESULT __stdcall list_close(Wrapper* self)
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
         discard_list_gpu_writes(self);
-        discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
         discard_mesh_lease_recording(list);
         retire_drop_recording(self);
@@ -3222,10 +3246,19 @@ void retire_drop_recording(Wrapper* list)
     retire_discard_holds(list);
 }
 
+void clear_draw_sampler_snapshot(Wrapper* self)
+{
+    if (!self->own().pass) return;
+    auto& pass = pass_of(self);
+    pass.sampler_heap.Reset();
+    pass.sampler_snapshot.reset();
+}
+
 // A reset list has no viewport or scissor and uses the default stencil reference.
 void reset_list_dynamic_state(Wrapper* self)
 {
     if (!self->own().pass) return;
+    clear_draw_sampler_snapshot(self);
     pass_of(self).compute_root_srvs.fill(0);
     pass_of(self).compute_root_srv_set = 0;
     pass_of(self).stencil_reference = 0;
@@ -4623,7 +4656,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 }
             });
             retire_address_uploads(queue, native_lists);
-            retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);

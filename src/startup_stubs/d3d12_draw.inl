@@ -1381,51 +1381,7 @@ bool ensure_draw_heap(Wrapper* device)
     return true;
 }
 
-// A recorded table is immutable. Keep it alive until its submission completes,
-// including when the title resets the command list with a different allocator.
 using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
-std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
-struct SubmittedDrawSamplerHeaps {
-    x2w_startup::ComPtr<ID3D12Fence> fence;
-    std::vector<DrawSamplerHeap> heaps;
-};
-std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
-
-void discard_draw_sampler_heaps(ID3D12CommandList* list)
-{
-    AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(list);
-    ReleaseSRWLockExclusive(&draw_lock);
-}
-
-// draw_lock held. The lists have already been executed on this queue. A closed list can be
-// submitted again until its Reset, so each submit takes its own references and the recording
-// keeps its own until discard_draw_sampler_heaps.
-void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
-{
-    submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
-        submitted_draw_sampler_heaps.end(), [](const SubmittedDrawSamplerHeaps& batch) {
-            return batch.fence && batch.fence->GetCompletedValue() != 0;
-        }), submitted_draw_sampler_heaps.end());
-    SubmittedDrawSamplerHeaps batch;
-    for (auto* list : lists) {
-        auto it = recorded_draw_sampler_heaps.find(list);
-        if (it == recorded_draw_sampler_heaps.end()) continue;
-        for (const auto& heap : it->second) batch.heaps.push_back(heap);
-    }
-    if (batch.heaps.empty()) return;
-    x2w_startup::ComPtr<ID3D12Device> device;
-    HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
-    if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
-    if (FAILED(hr)) {
-        // Without a completion point the submitted descriptors still belong
-        // to the queue. Retain them instead of reclaiming them early.
-        batch.fence.Reset();
-        log("x2w-draw sampler heap retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
-    }
-    submitted_draw_sampler_heaps.push_back(std::move(batch));
-}
 
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
@@ -1563,7 +1519,7 @@ bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_
 }
 
 // draw_lock held.
-bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
+bool prepare_draw_sampler_heap(Wrapper* self, Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
 {
     auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
     if (!pass.title_samplers.address && pass.sampler_heap_wrapper) {
@@ -1590,15 +1546,40 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
         log("x2w-draw sampler heap creation failed 0x%08lx", static_cast<unsigned long>(hr));
         return false;
     }
+    std::unique_ptr<x2w_startup::SamplerSnapshot> cached;
+    try {
+        cached = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+        x2w_startup::ExclusiveNoteLock lock(allocator_lock);
+        const auto recording = list_recordings.find(self);
+        if (!self->own().list_open || self->own().real != list ||
+            recording == list_recordings.end() || !recording->second)
+            return false;
+        recording->second->sampler_snapshots.push_back(heap);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
     static LONG reports;
     if (first_calls(reports, 12))
         log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
             "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
             counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
-    recorded_draw_sampler_heaps[list].push_back(heap);
     pass.sampler_heap = std::move(heap);
-    pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
+    pass.sampler_snapshot = std::move(cached);
     return true;
+}
+
+// Fixture entry records a default sampler table through the translated draw path.
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_record_sampler_snapshot(void* guest_list)
+{
+    Wrapper* self = as_wrapper(guest_list);
+    if (!self || self->own().kind != list_kind || !self->own().real || !the_device) return FALSE;
+    x2w_startup::ExclusiveNoteLock lock(draw_lock);
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    Pass pass;
+    if (!prepare_draw_sampler_heap(self, pass, list, false)) return FALSE;
+    ID3D12DescriptorHeap* heaps[] = {pass.sampler_heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    return TRUE;
 }
 
 // Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
@@ -2743,7 +2724,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         indirect->set_refusal("translated indexed rectangle geometry unavailable",
                               indirect_refusal_code::indexed_rect_unavailable);
     }
-    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(self, pass, list, tr->samplers.reserved_fallback))) {
         if (indirect && !(indexed_rect && !pipeline))
             indirect->refusal_code = !pipeline ? indirect_refusal_code::pipeline_unavailable
                                                : indirect_refusal_code::sampler_heap_unavailable;

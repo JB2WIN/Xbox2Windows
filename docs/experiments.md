@@ -750,6 +750,12 @@ Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepend
 
 ## Recovering a failed startup command-list recording
 
+The `startup_list_resubmit` fixture also records a translated sampler snapshot and
+submits its list to two queues. The second queue waits on a CPU-released fence.
+Releasing the list and resetting the allocator keeps the snapshot alive while the
+second submission is blocked. Once both tracked queues complete, reusing the first
+allocator releases the snapshot. The untracked-submit case keeps it retained.
+
 The source-built `startup_list_resubmit` fixture keeps a valid compute submission behind a
 queue wait, then calls `RSSetViewports` on a second recording of the same list. Desktop
 `Close` fails and the shim drops that recording. A `Reset` with a direct allocator must
