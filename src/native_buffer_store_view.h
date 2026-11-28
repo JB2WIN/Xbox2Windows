@@ -61,6 +61,12 @@ inline bool native_buffer_store_view(const ComputeViewBinding &binding, D3D12_UN
         stride = 4;
     } else if (view.Buffer.Flags) {
         return false;
+    } else if (binding.kind == ComputeViewKind::packed_d16_x_uav) {
+        if (stride != 2) return false;
+        if (view.Format == DXGI_FORMAT_R32_UINT) stride = 4;
+        else if (view.Format == DXGI_FORMAT_R16_FLOAT || view.Format == DXGI_FORMAT_R16_UINT)
+            view.Format = DXGI_FORMAT_R16_UINT;
+        else return false;
     } else if (binding.kind == ComputeViewKind::half_buffer_uav) {
         const auto format = native_half_buffer_format(stride);
         if (format == DXGI_FORMAT_UNKNOWN || view.Format != format)
